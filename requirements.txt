@@ -1,4 +1,4 @@
-flask==3.0.3
-anthropic==0.31.2
-yfinance==0.2.43
-gunicorn==22.0.0
+flask>=3.0.3
+anthropic>=0.96.0
+yfinance>=0.2.43
+gunicorn>=22.0.0

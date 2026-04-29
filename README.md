@@ -34,6 +34,9 @@ Open `http://localhost:8050`, then enter examples such as:
 ## Render Deployment
 
 The repository includes both `render.yaml` and `Procfile`.
+It also pins Python 3.11 through `.python-version` and `PYTHON_VERSION`
+because the data-science dependencies are safer on Python 3.11 than on
+Render's newest default runtime.
 
 For Render:
 

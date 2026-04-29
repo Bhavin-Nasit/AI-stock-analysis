@@ -6,3 +6,6 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
     autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11

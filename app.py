@@ -1,960 +1,2153 @@
-from flask import Flask, request, jsonify, Response
-import subprocess, sys, os, json, re
-import yfinance as yf
-import anthropic
-from datetime import datetime
+from __future__ import annotations
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+import argparse
+import io
+import math
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import lru_cache
+from html import escape
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from flask import Flask, Response, render_template_string, request, send_file, url_for
+
+
 app = Flask(__name__)
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
-# ── Indian stock resolver ─────────────────────────────────────────────────────
-def resolve_indian_ticker(raw: str) -> str:
-    """Add .NS suffix for NSE if not already present. Try .BO (BSE) as fallback."""
-    raw = raw.strip().upper()
-    if raw.endswith(".NS") or raw.endswith(".BO"):
-        return raw
-    return raw + ".NS"
+DISCLAIMER = (
+    "This dashboard is for educational and research purposes only. It is not "
+    "financial advice, investment advice, or a recommendation to buy, sell, or "
+    "hold any security. Verify all data independently and consult a licensed "
+    "financial advisor before making investment decisions."
+)
 
-def get_stock_data(ticker: str) -> dict:
+
+WEIGHTS = {
+    "technical": 0.25,
+    "fundamental": 0.25,
+    "sentiment": 0.20,
+    "risk": 0.15,
+    "thesis": 0.15,
+}
+
+
+INDIAN_STOCK_ALIASES = {
+    "RELIANCE": "RELIANCE.NS",
+    "RELIANCE INDUSTRIES": "RELIANCE.NS",
+    "TCS": "TCS.NS",
+    "TATA CONSULTANCY": "TCS.NS",
+    "INFY": "INFY.NS",
+    "INFOSYS": "INFY.NS",
+    "HDFC BANK": "HDFCBANK.NS",
+    "HDFCBANK": "HDFCBANK.NS",
+    "ICICI BANK": "ICICIBANK.NS",
+    "ICICIBANK": "ICICIBANK.NS",
+    "SBI": "SBIN.NS",
+    "STATE BANK OF INDIA": "SBIN.NS",
+    "SBIN": "SBIN.NS",
+    "ITC": "ITC.NS",
+    "LT": "LT.NS",
+    "LARSEN": "LT.NS",
+    "LARSEN TOUBRO": "LT.NS",
+    "BHARTI AIRTEL": "BHARTIARTL.NS",
+    "AIRTEL": "BHARTIARTL.NS",
+    "AXIS BANK": "AXISBANK.NS",
+    "AXISBANK": "AXISBANK.NS",
+    "KOTAK BANK": "KOTAKBANK.NS",
+    "KOTAKBANK": "KOTAKBANK.NS",
+    "MARUTI": "MARUTI.NS",
+    "SUN PHARMA": "SUNPHARMA.NS",
+    "SUNPHARMA": "SUNPHARMA.NS",
+    "TATA MOTORS": "TATAMOTORS.NS",
+    "TATAMOTORS": "TATAMOTORS.NS",
+    "BAJFINANCE": "BAJFINANCE.NS",
+    "BAJAJ FINANCE": "BAJFINANCE.NS",
+    "HUL": "HINDUNILVR.NS",
+    "HINDUSTAN UNILEVER": "HINDUNILVR.NS",
+    "HINDUNILVR": "HINDUNILVR.NS",
+    "ASIAN PAINTS": "ASIANPAINT.NS",
+    "ASIANPAINT": "ASIANPAINT.NS",
+    "ADANI ENTERPRISES": "ADANIENT.NS",
+    "ADANIENT": "ADANIENT.NS",
+    "WIPRO": "WIPRO.NS",
+    "HCLTECH": "HCLTECH.NS",
+    "HCL TECHNOLOGIES": "HCLTECH.NS",
+    "ULTRACEMCO": "ULTRACEMCO.NS",
+    "ULTRATECH": "ULTRACEMCO.NS",
+    "NTPC": "NTPC.NS",
+    "POWERGRID": "POWERGRID.NS",
+    "POWER GRID": "POWERGRID.NS",
+    "ONGC": "ONGC.NS",
+    "COAL INDIA": "COALINDIA.NS",
+    "COALINDIA": "COALINDIA.NS",
+    "TITAN": "TITAN.NS",
+    "NESTLE INDIA": "NESTLEIND.NS",
+    "NESTLEIND": "NESTLEIND.NS",
+    "M&M": "M&M.NS",
+    "MAHINDRA": "M&M.NS",
+    "MAHINDRA MAHINDRA": "M&M.NS",
+    "BAJAJ AUTO": "BAJAJ-AUTO.NS",
+    "TECH MAHINDRA": "TECHM.NS",
+    "TECHM": "TECHM.NS",
+    "JSW STEEL": "JSWSTEEL.NS",
+    "JSWSTEEL": "JSWSTEEL.NS",
+    "TATA STEEL": "TATASTEEL.NS",
+    "TATASTEEL": "TATASTEEL.NS",
+    "HINDALCO": "HINDALCO.NS",
+    "CIPLA": "CIPLA.NS",
+    "DR REDDY": "DRREDDY.NS",
+    "DRREDDY": "DRREDDY.NS",
+    "DIVIS LAB": "DIVISLAB.NS",
+    "DIVISLAB": "DIVISLAB.NS",
+    "EICHER": "EICHERMOT.NS",
+    "EICHER MOTORS": "EICHERMOT.NS",
+    "GRASIM": "GRASIM.NS",
+    "HEROMOTOCO": "HEROMOTOCO.NS",
+    "HERO MOTOCORP": "HEROMOTOCO.NS",
+    "INDUSIND BANK": "INDUSINDBK.NS",
+    "INDUSINDBK": "INDUSINDBK.NS",
+    "BRITANNIA": "BRITANNIA.NS",
+    "APOLLO HOSPITALS": "APOLLOHOSP.NS",
+    "APOLLOHOSP": "APOLLOHOSP.NS",
+}
+
+
+SECTOR_CYCLICALITY = {
+    "Financial Services": 0.62,
+    "Basic Materials": 0.72,
+    "Consumer Cyclical": 0.68,
+    "Energy": 0.70,
+    "Industrials": 0.62,
+    "Real Estate": 0.72,
+    "Technology": 0.58,
+    "Communication Services": 0.55,
+    "Healthcare": 0.36,
+    "Consumer Defensive": 0.32,
+    "Utilities": 0.28,
+}
+
+
+POSITIVE_NEWS_WORDS = {
+    "beat",
+    "beats",
+    "upgrade",
+    "upgrades",
+    "surge",
+    "surges",
+    "profit",
+    "profits",
+    "growth",
+    "record",
+    "launch",
+    "expansion",
+    "wins",
+    "order",
+    "raises",
+    "dividend",
+    "buyback",
+    "approval",
+    "partnership",
+    "deal",
+    "rally",
+    "outperform",
+}
+
+
+NEGATIVE_NEWS_WORDS = {
+    "miss",
+    "misses",
+    "downgrade",
+    "downgrades",
+    "falls",
+    "fall",
+    "decline",
+    "declines",
+    "loss",
+    "losses",
+    "probe",
+    "fraud",
+    "lawsuit",
+    "penalty",
+    "weak",
+    "slump",
+    "slumps",
+    "delay",
+    "concern",
+    "concerns",
+    "cut",
+    "cuts",
+    "warning",
+    "debt",
+}
+
+
+@dataclass
+class ScoreBlock:
+    score: int
+    label: str
+    summary: str
+    sub_scores: Dict[str, Dict[str, Any]]
+    bullets: List[str]
+    details: Dict[str, Any]
+
+
+def clamp(value: float, low: float = 0, high: float = 100) -> float:
+    if value is None or math.isnan(float(value)):
+        return low
+    return max(low, min(high, float(value)))
+
+
+def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        hist = stock.history(period="1y")
-
-        if not info or info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
-            # Try BSE fallback
-            base = ticker.replace(".NS", "").replace(".BO", "")
-            stock = yf.Ticker(base + ".BO")
-            info = stock.info
-            hist = stock.history(period="1y")
-            ticker = base + ".BO"
-
-        price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-        prev  = info.get("previousClose", price) or price
-        chg   = ((price - prev) / prev * 100) if prev else 0
-
-        # Calculate technicals from history
-        closes = hist["Close"].tolist() if not hist.empty else []
-        volumes = hist["Volume"].tolist() if not hist.empty else []
-        sma50  = sum(closes[-50:]) / len(closes[-50:])  if len(closes) >= 50  else None
-        sma200 = sum(closes[-200:])/ len(closes[-200:]) if len(closes) >= 200 else None
-        high52 = max(closes[-252:]) if len(closes) >= 30 else info.get("fiftyTwoWeekHigh")
-        low52  = min(closes[-252:]) if len(closes) >= 30 else info.get("fiftyTwoWeekLow")
-        avg_vol_30 = sum(volumes[-30:]) / 30 if len(volumes) >= 30 else None
-
-        # RSI (14-day)
-        rsi = None
-        if len(closes) >= 15:
-            deltas = [closes[i]-closes[i-1] for i in range(1,len(closes))]
-            gains  = [d if d>0 else 0 for d in deltas[-14:]]
-            losses = [-d if d<0 else 0 for d in deltas[-14:]]
-            avg_g  = sum(gains)/14; avg_l = sum(losses)/14
-            rs = avg_g/avg_l if avg_l else 100
-            rsi = round(100 - 100/(1+rs), 1)
-
-        return {
-            "ticker": ticker,
-            "name":   info.get("longName") or info.get("shortName", ticker),
-            "currency": "INR",
-            "price":  price,
-            "change_pct": round(chg, 2),
-            "market_cap": info.get("marketCap"),
-            "pe_ttm":     info.get("trailingPE"),
-            "pe_fwd":     info.get("forwardPE"),
-            "pb":         info.get("priceToBook"),
-            "ps":         info.get("priceToSalesTrailing12Months"),
-            "eps":        info.get("trailingEps"),
-            "eps_fwd":    info.get("forwardEps"),
-            "revenue":    info.get("totalRevenue"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "earnings_growth": info.get("earningsGrowth"),
-            "ebitda":     info.get("ebitda"),
-            "profit_margin": info.get("profitMargins"),
-            "roe":        info.get("returnOnEquity"),
-            "roa":        info.get("returnOnAssets"),
-            "debt_equity": info.get("debtToEquity"),
-            "current_ratio": info.get("currentRatio"),
-            "free_cashflow": info.get("freeCashflow"),
-            "operating_cashflow": info.get("operatingCashflow"),
-            "52w_high": high52,
-            "52w_low":  low52,
-            "sma50":    round(sma50, 2) if sma50 else None,
-            "sma200":   round(sma200, 2) if sma200 else None,
-            "rsi14":    rsi,
-            "avg_vol_30d": avg_vol_30,
-            "avg_volume": info.get("averageVolume"),
-            "beta":     info.get("beta"),
-            "dividend_yield": info.get("dividendYield"),
-            "dividend_rate":  info.get("dividendRate"),
-            "payout_ratio":   info.get("payoutRatio"),
-            "sector":   info.get("sector"),
-            "industry": info.get("industry"),
-            "exchange": info.get("exchange"),
-            "employees": info.get("fullTimeEmployees"),
-            "description": info.get("longBusinessSummary", ""),
-            "recommendation": info.get("recommendationKey"),
-            "analyst_count": info.get("numberOfAnalystOpinions"),
-            "target_high": info.get("targetHighPrice"),
-            "target_low":  info.get("targetLowPrice"),
-            "target_mean": info.get("targetMeanPrice"),
-            "price_history_30d": closes[-30:],
-            "volume_history_30d": volumes[-30:],
-        }
-    except Exception as e:
-        return {"error": str(e), "ticker": ticker}
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.replace(",", "").replace("%", "").strip()
+            if value in {"", "None", "nan", "NaN", "N/A"}:
+                return default
+        result = float(value)
+        if math.isnan(result) or math.isinf(result):
+            return default
+        return result
+    except (TypeError, ValueError):
+        return default
 
 
-def run_agent_script(path: str, ticker: str) -> str:
-    full = os.path.join(BASE_DIR, path)
-    if not os.path.exists(full):
-        return ""
+def safe_int(value: Any, default: int = 0) -> int:
+    number = safe_float(value)
+    if number is None:
+        return default
+    return int(number)
+
+
+def fmt_money(value: Any, currency: str = "INR") -> str:
+    number = safe_float(value)
+    if number is None:
+        return "Data unavailable"
+    abs_number = abs(number)
+    if currency.upper() == "INR":
+        if abs_number >= 10_000_000:
+            return f"INR {number / 10_000_000:,.2f} cr"
+        if abs_number >= 100_000:
+            return f"INR {number / 100_000:,.2f} lakh"
+        return f"INR {number:,.2f}"
+    return f"{currency} {number:,.2f}"
+
+
+def fmt_price(value: Any, currency: str = "INR") -> str:
+    number = safe_float(value)
+    if number is None:
+        return "Data unavailable"
+    prefix = "INR" if currency.upper() == "INR" else currency.upper()
+    return f"{prefix} {number:,.2f}"
+
+
+def fmt_large_number(value: Any) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "Data unavailable"
+    abs_number = abs(number)
+    if abs_number >= 10_000_000:
+        return f"{number / 10_000_000:,.2f} cr"
+    if abs_number >= 100_000:
+        return f"{number / 100_000:,.2f} lakh"
+    return f"{number:,.0f}"
+
+
+def fmt_pct(value: Any, digits: int = 1, already_percent: bool = False) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "Data unavailable"
+    if not already_percent:
+        number *= 100
+    return f"{number:,.{digits}f}%"
+
+
+def fmt_ratio(value: Any, digits: int = 2) -> str:
+    number = safe_float(value)
+    if number is None:
+        return "Data unavailable"
+    return f"{number:,.{digits}f}x"
+
+
+def as_inr_debt_to_equity(value: Any) -> Optional[float]:
+    number = safe_float(value)
+    if number is None:
+        return None
+    return number / 100 if abs(number) > 5 else number
+
+
+def score_to_grade(score: float) -> str:
+    if score >= 85:
+        return "A+"
+    if score >= 70:
+        return "A"
+    if score >= 55:
+        return "B"
+    if score >= 40:
+        return "C"
+    if score >= 25:
+        return "D"
+    return "F"
+
+
+def score_to_signal(score: float) -> str:
+    if score >= 85:
+        return "Strong Buy"
+    if score >= 70:
+        return "Buy"
+    if score >= 55:
+        return "Hold / Accumulate"
+    if score >= 40:
+        return "Neutral"
+    if score >= 25:
+        return "Caution"
+    return "Avoid"
+
+
+def score_tone(score: float) -> str:
+    if score >= 70:
+        return "positive"
+    if score >= 55:
+        return "balanced"
+    if score >= 40:
+        return "watch"
+    return "negative"
+
+
+def normalize_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text.replace("-", " ").upper()).strip()
+
+
+def resolve_candidates(query: str) -> List[str]:
+    raw = (query or "").strip()
+    if not raw:
+        return []
+    upper = raw.upper().strip()
+    normalized = normalize_key(upper)
+
+    if normalized in INDIAN_STOCK_ALIASES:
+        symbol = INDIAN_STOCK_ALIASES[normalized]
+        return [symbol, symbol.replace(".NS", ".BO")]
+
+    if upper.endswith((".NS", ".BO")):
+        return [upper]
+
+    if re.fullmatch(r"\d{6}", upper):
+        return [f"{upper}.BO", f"{upper}.NS"]
+
+    compact = re.sub(r"[^A-Z0-9&]", "", upper)
+    if compact in INDIAN_STOCK_ALIASES:
+        return [INDIAN_STOCK_ALIASES[compact]]
+
+    candidates = [f"{compact}.NS", f"{compact}.BO"]
+    return list(dict.fromkeys([candidate for candidate in candidates if candidate]))
+
+
+def import_yfinance():
     try:
-        r = subprocess.run([sys.executable, full, ticker],
-                           capture_output=True, text=True, timeout=60)
-        return r.stdout.strip()
+        import yfinance as yf
+    except ImportError as exc:
+        raise RuntimeError(
+            "The yfinance package is not installed. Run: pip install -r requirements.txt"
+        ) from exc
+    return yf
+
+
+@lru_cache(maxsize=64)
+def fetch_symbol_bundle(symbol: str) -> Dict[str, Any]:
+    yf = import_yfinance()
+    ticker = yf.Ticker(symbol)
+
+    history = ticker.history(period="2y", interval="1d", auto_adjust=False)
+    if history is None or history.empty:
+        raise ValueError(f"No price history returned for {symbol}.")
+
+    history = history.reset_index()
+    if "Date" in history:
+        history["Date"] = pd.to_datetime(history["Date"]).dt.tz_localize(None)
+
+    info: Dict[str, Any] = {}
+    try:
+        info = ticker.info or {}
     except Exception:
-        return ""
+        info = {}
 
-
-def fmt_inr(v):
-    if v is None: return "N/A"
-    if isinstance(v, float) and (v != v): return "N/A"  # nan
+    news: List[Dict[str, Any]] = []
     try:
-        v = float(v)
-        if abs(v) >= 1e12: return f"₹{v/1e12:.2f}L Cr"
-        if abs(v) >= 1e7:  return f"₹{v/1e7:.2f} Cr"
-        if abs(v) >= 1e5:  return f"₹{v/1e5:.2f} L"
-        return f"₹{v:,.2f}"
-    except: return str(v)
-
-def fmt_pct(v):
-    if v is None: return "N/A"
-    try: return f"{float(v)*100:.1f}%"
-    except: return str(v)
-
-def fmt_x(v, decimals=1):
-    if v is None: return "N/A"
-    try: return f"{float(v):.{decimals}f}x"
-    except: return str(v)
-
-def fmt_num(v, decimals=2):
-    if v is None: return "N/A"
-    try: return f"{float(v):.{decimals}f}"
-    except: return str(v)
-
-
-def generate_analysis_stream(ticker: str):
-    def sse(event, data):
-        safe = data.replace("\n", "\\n")
-        return f"event: {event}\ndata: {safe}\n\n"
-
-    yield sse("status", "📡 Fetching NSE/BSE market data...")
-    d = get_stock_data(ticker)
-
-    if "error" in d:
-        yield sse("error", f"Could not fetch data for {ticker}. Please check the ticker symbol (e.g. RELIANCE, TCS, INFY).")
-        return
-
-    yield sse("stockdata", json.dumps(d))
-    yield sse("status", f"✅ Got live data for {d['name']}")
-
-    # Run local agents
-    agent_outputs = {}
-    for name, path in [
-        ("technical", "agents/technical_analyst.py"),
-        ("fundamental", "agents/fundamental_analyst.py"),
-        ("sentiment", "agents/sentiment_agent.py"),
-        ("risk", "agents/risk_agent.py"),
-        ("canslim", "skills/canslim_screener.py"),
-    ]:
-        out = run_agent_script(path, ticker)
-        if out:
-            agent_outputs[name] = out
-            yield sse("status", f"✅ {name.title()} agent completed")
-
-    agent_section = ""
-    if agent_outputs:
-        agent_section = "\n\n## LOCAL AGENT OUTPUTS (incorporate these findings)\n"
-        for name, out in agent_outputs.items():
-            agent_section += f"\n### {name.upper()}\n{out}\n"
-
-    # Position in 52w range
-    pos52w = "N/A"
-    if d["52w_high"] and d["52w_low"] and d["price"]:
-        rng = d["52w_high"] - d["52w_low"]
-        pos52w = f"{((d['price'] - d['52w_low']) / rng * 100):.0f}% of 52-week range" if rng else "N/A"
-
-    trend = "SIDEWAYS"
-    if d["sma50"] and d["sma200"] and d["price"]:
-        if d["price"] > d["sma50"] > d["sma200"]: trend = "STRONG UPTREND"
-        elif d["price"] > d["sma200"]: trend = "UPTREND"
-        elif d["price"] < d["sma50"] < d["sma200"]: trend = "STRONG DOWNTREND"
-        elif d["price"] < d["sma200"]: trend = "DOWNTREND"
-
-    yield sse("status", "🤖 Running multi-agent AI analysis...")
-
-    prompt = f"""You are a senior Indian equity research analyst at a top-tier institution like ICICI Securities, Motilal Oswal, or Kotak Securities. 
-Produce a detailed, institutional-quality equity research report for **{d['name']} ({ticker})** listed on {d.get('exchange','NSE/BSE')}.
-All monetary values MUST be in Indian Rupees (₹). Use Indian number system (Lakhs, Crores).
-
-## RAW MARKET DATA (use all figures accurately)
-
-**Price & Market Data**
-- CMP (Current Market Price): ₹{fmt_num(d['price'])}
-- Day Change: {fmt_num(d['change_pct'])}%
-- Market Cap: {fmt_inr(d['market_cap'])}
-- 52-Week High: ₹{fmt_num(d['52w_high'])}  |  52-Week Low: ₹{fmt_num(d['52w_low'])}
-- Position in 52W Range: {pos52w}
-- Beta: {fmt_num(d['beta'])}
-
-**Valuation Metrics**
-- P/E (TTM): {fmt_x(d['pe_ttm'])}
-- Forward P/E: {fmt_x(d['pe_fwd'])}
-- Price/Book: {fmt_x(d['pb'])}
-- Price/Sales: {fmt_x(d['ps'])}
-- EPS (TTM): ₹{fmt_num(d['eps'])}
-- Forward EPS: ₹{fmt_num(d['eps_fwd'])}
-
-**Financials**
-- Revenue (TTM): {fmt_inr(d['revenue'])}
-- Revenue Growth (YoY): {fmt_pct(d['revenue_growth'])}
-- EBITDA: {fmt_inr(d['ebitda'])}
-- Net Profit Margin: {fmt_pct(d['profit_margin'])}
-- Earnings Growth: {fmt_pct(d['earnings_growth'])}
-
-**Balance Sheet & Returns**
-- ROE: {fmt_pct(d['roe'])}
-- ROA: {fmt_pct(d['roa'])}
-- Debt/Equity: {fmt_num(d['debt_equity'])}
-- Current Ratio: {fmt_num(d['current_ratio'])}
-- Free Cash Flow: {fmt_inr(d['free_cashflow'])}
-- Operating Cash Flow: {fmt_inr(d['operating_cashflow'])}
-
-**Dividends**
-- Dividend Yield: {fmt_pct(d['dividend_yield'])}
-- Annual Dividend: ₹{fmt_num(d['dividend_rate'])}
-- Payout Ratio: {fmt_pct(d['payout_ratio'])}
-
-**Technical Indicators**
-- 50-DMA: ₹{fmt_num(d['sma50'])}
-- 200-DMA: ₹{fmt_num(d['sma200'])}
-- RSI (14): {fmt_num(d['rsi14'], 1)}
-- Trend: {trend}
-
-**Analyst Consensus**
-- Target (Mean): ₹{fmt_num(d['target_mean'])}
-- Target High: ₹{fmt_num(d['target_high'])}
-- Target Low: ₹{fmt_num(d['target_low'])}
-- Analyst Count: {d['analyst_count']}
-- Consensus: {(d['recommendation'] or 'N/A').upper()}
-
-**Company Profile**
-- Sector: {d['sector']}  |  Industry: {d['industry']}
-- Employees: {d['employees']}
-{agent_section}
-
----
-
-Now generate a **comprehensive 7-8 page institutional equity research report** with EXACTLY these sections. Be thorough, specific, and data-driven. Use the actual numbers provided. All prices in ₹, all large numbers in Indian system (Cr, L).
-
----
-
-## EXECUTIVE SUMMARY
-
-Write 3-4 paragraphs covering: investment thesis in one line, company overview, key financial highlights, and your overall stance (BUY/HOLD/SELL). Include your 12-month price target prominently.
-
----
-
-## SECTION 1: COMPANY OVERVIEW & BUSINESS MODEL
-
-- Business segments and revenue mix
-- Competitive positioning and market share
-- Key products/services and their growth drivers  
-- Management quality and promoter holding context
-- Recent strategic initiatives or major developments
-
----
-
-## SECTION 2: INDUSTRY & MACRO ANALYSIS
-
-- Industry size, growth rate (TAM/SAM)
-- India-specific macro tailwinds or headwinds
-- Competitive landscape: key peers and market dynamics
-- Regulatory environment relevant to this sector
-- How current RBI/government policy affects this business
-
----
-
-## SECTION 3: FINANCIAL ANALYSIS
-
-### Revenue & Profitability
-Analyze the revenue trend, margin profile, and earnings quality using the data provided.
-
-### Valuation Analysis  
-- Compute: Is P/E of {fmt_x(d['pe_ttm'])} cheap/fair/expensive vs Indian sector peers?
-- P/B of {fmt_x(d['pb'])} vs asset-heavy or asset-light peers
-- PEG ratio interpretation
-- DCF narrative: what growth rates justify current valuation?
-
-### Balance Sheet Assessment
-- Debt comfort level given D/E of {fmt_num(d['debt_equity'])}
-- Cash flow quality — FCF of {fmt_inr(d['free_cashflow'])}
-- Working capital and liquidity position
-
----
-
-## SECTION 4: TECHNICAL ANALYSIS
-
-- **Trend**: {trend} — detailed interpretation
-- **Support Levels**: Calculate 2-3 key support levels below CMP ₹{fmt_num(d['price'])}
-- **Resistance Levels**: Calculate 2-3 key resistance levels above CMP
-- **Moving Averages**: Price vs 50-DMA (₹{fmt_num(d['sma50'])}) and 200-DMA (₹{fmt_num(d['sma200'])}) — what does this signal?
-- **RSI**: {fmt_num(d['rsi14'], 1)} — overbought/oversold/neutral interpretation
-- **52W Range**: Stock at {pos52w} — momentum context
-- **Volume analysis**: what average volumes suggest about institutional participation
-- Chart pattern description (breakout/consolidation/distribution)
-- Near-term technical outlook: next 1-3 months
-
----
-
-## SECTION 5: BULL CASE vs BEAR CASE
-
-### 🟢 BULL CASE (Target: ₹[calculate optimistic target])
-List 4-5 specific catalysts with quantified impact where possible:
-- Growth catalyst 1 with numbers
-- Growth catalyst 2 with numbers
-- Sector tailwind
-- Valuation re-rating trigger
-- Operational leverage
-
-### 🔴 BEAR CASE (Target: ₹[calculate downside target])
-List 4-5 specific risks with impact assessment:
-- Key risk 1 with downside scenario
-- Key risk 2
-- Macro/regulatory risk
-- Competitive disruption risk
-- Execution risk
-
----
-
-## SECTION 6: RISK MATRIX
-
-Create a structured risk assessment table in markdown format:
-
-| Risk Factor | Likelihood | Impact | Mitigation |
-|-------------|-----------|--------|------------|
-[Fill 6-8 rows with specific risks for this company]
-
-Overall Risk Rating: [Low / Medium / High / Very High] with justification.
-
----
-
-## SECTION 7: INVESTMENT VERDICT & RECOMMENDATION
-
-### Verdict: [BUY / ACCUMULATE / HOLD / REDUCE / SELL]
-
-**12-Month Price Target: ₹[specific number]**  
-**Upside/Downside from CMP: [%]**
-
-**Target Basis**: [P/E target / DCF / EV/EBITDA — explain which multiple and why]
-
-**Investment Thesis** (2 paragraphs): Summarise the core reason to own or avoid this stock.
-
-**Entry Strategy**:
-- Ideal buying range: ₹[range]
-- Stop loss: ₹[level] ([% below CMP])
-- Add more on dips to: ₹[level]
-
-**Position Sizing**: 
-- Suitable for: [Conservative / Moderate / Aggressive investors]
-- Suggested portfolio weight: [X%]
-- Time horizon: [Short (3-6m) / Medium (6-18m) / Long (2-5y)]
-
-**Key Monitorables**: 3-4 specific metrics or events to watch each quarter.
-
----
-
-## SECTION 8: PEER COMPARISON
-
-Compare {d['name']} with 3-4 key Indian listed peers on:
-- P/E, P/B, EV/EBITDA
-- Revenue growth, margin profile
-- ROE, Debt/Equity
-- Brief qualitative differentiation
-
-Conclude which is the best risk-reward in the peer group currently.
-
----
-
-*Report generated: {datetime.now().strftime('%d %B %Y, %I:%M %p IST')}*  
-*Data source: NSE/BSE via Yahoo Finance*  
-*This report is for educational purposes only and not SEBI-registered investment advice.*"""
-
-    yield sse("status", "📝 Writing institutional research report...")
+        news = ticker.news or []
+    except Exception:
+        news = []
+
+    calendar: Any = None
     try:
-        with client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=6000,
-            messages=[{"role": "user", "content": prompt}]
-        ) as stream:
-            for text in stream.text_stream:
-                yield sse("chunk", text)
-    except Exception as e:
-        yield sse("error", f"AI analysis failed: {str(e)}")
-        return
+        calendar = ticker.calendar
+    except Exception:
+        calendar = None
 
-    yield sse("done", "Report complete")
+    return {
+        "symbol": symbol,
+        "history": history,
+        "info": info,
+        "news": news,
+        "calendar": calendar,
+        "retrieved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
 
 
-HTML_PAGE = r"""
-<!DOCTYPE html>
+def load_stock_bundle(query: str) -> Dict[str, Any]:
+    errors = []
+    for symbol in resolve_candidates(query):
+        try:
+            return fetch_symbol_bundle(symbol)
+        except Exception as exc:
+            errors.append(f"{symbol}: {exc}")
+    raise ValueError(
+        "Could not find usable NSE/BSE market data for this input. "
+        f"Tried: {', '.join(resolve_candidates(query)) or 'no candidates'}. "
+        f"Details: {' | '.join(errors) if errors else 'No symbol candidates.'}"
+    )
+
+
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_macd(close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    histogram = macd - signal
+    return macd, signal, histogram
+
+
+def compute_atr(frame: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = frame["High"].astype(float)
+    low = frame["Low"].astype(float)
+    close = frame["Close"].astype(float)
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return true_range.rolling(period).mean()
+
+
+def pct_return(close: pd.Series, periods: int) -> Optional[float]:
+    if len(close) <= periods:
+        return None
+    start = safe_float(close.iloc[-periods - 1])
+    end = safe_float(close.iloc[-1])
+    if not start or end is None:
+        return None
+    return (end / start) - 1
+
+
+def annualized_volatility(close: pd.Series, lookback: int = 90) -> Optional[float]:
+    returns = close.pct_change().dropna().tail(lookback)
+    if len(returns) < 20:
+        return None
+    return float(returns.std() * math.sqrt(252))
+
+
+def max_drawdown(close: pd.Series) -> Optional[float]:
+    if close.empty:
+        return None
+    cumulative_high = close.cummax()
+    drawdown = close / cumulative_high - 1
+    return float(drawdown.min())
+
+
+def unique_levels(levels: Iterable[Optional[float]], price: float, side: str) -> List[float]:
+    cleaned = []
+    for level in levels:
+        number = safe_float(level)
+        if number is None or number <= 0:
+            continue
+        if side == "support" and number >= price:
+            continue
+        if side == "resistance" and number <= price:
+            continue
+        if all(abs(number - existing) / price > 0.015 for existing in cleaned):
+            cleaned.append(number)
+    reverse = side == "support"
+    return sorted(cleaned, reverse=reverse)[:3]
+
+
+def infer_next_earnings(calendar: Any) -> str:
+    if calendar is None:
+        return "Data unavailable"
+    try:
+        if isinstance(calendar, pd.DataFrame) and not calendar.empty:
+            for value in calendar.values.flatten():
+                if pd.notna(value):
+                    return str(pd.to_datetime(value).date())
+        if isinstance(calendar, dict):
+            for value in calendar.values():
+                if isinstance(value, (list, tuple)) and value:
+                    return str(pd.to_datetime(value[0]).date())
+                if value:
+                    return str(pd.to_datetime(value).date())
+    except Exception:
+        return "Data unavailable"
+    return "Data unavailable"
+
+
+def extract_news_items(news: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    for raw in news[:8]:
+        content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
+        title = raw.get("title") or content.get("title") or ""
+        publisher = raw.get("publisher") or content.get("provider", {}).get("displayName") or ""
+        link = raw.get("link") or content.get("canonicalUrl", {}).get("url") or ""
+        published = raw.get("providerPublishTime") or content.get("pubDate") or ""
+        if isinstance(published, (int, float)):
+            published = datetime.fromtimestamp(published, tz=timezone.utc).strftime("%Y-%m-%d")
+        items.append(
+            {
+                "title": str(title),
+                "publisher": str(publisher),
+                "link": str(link),
+                "published": str(published)[:10],
+                "tone": classify_news_title(str(title)),
+            }
+        )
+    return [item for item in items if item["title"]]
+
+
+def classify_news_title(title: str) -> str:
+    words = set(re.findall(r"[a-z]+", title.lower()))
+    positive = len(words & POSITIVE_NEWS_WORDS)
+    negative = len(words & NEGATIVE_NEWS_WORDS)
+    if positive > negative:
+        return "Positive"
+    if negative > positive:
+        return "Negative"
+    return "Neutral"
+
+
+def sub_score(score: float, maximum: int, assessment: str) -> Dict[str, Any]:
+    return {
+        "score": int(round(clamp(score, 0, maximum))),
+        "max": maximum,
+        "assessment": assessment,
+    }
+
+
+def analyze_technical(history: pd.DataFrame, info: Dict[str, Any]) -> ScoreBlock:
+    frame = history.copy()
+    close = frame["Close"].astype(float)
+    high = frame["High"].astype(float)
+    low = frame["Low"].astype(float)
+    volume = frame["Volume"].fillna(0).astype(float)
+    price = float(close.iloc[-1])
+    previous = float(close.iloc[-2]) if len(close) > 1 else price
+
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    rsi = compute_rsi(close)
+    macd, macd_signal, macd_hist = compute_macd(close)
+    atr = compute_atr(frame)
+
+    ret_1m = pct_return(close, 21)
+    ret_3m = pct_return(close, 63)
+    ret_6m = pct_return(close, 126)
+    ret_1y = pct_return(close, 252)
+    realized_volatility = annualized_volatility(close, 90)
+    drawdown = max_drawdown(close)
+    high_52 = float(close.tail(252).max()) if len(close) else price
+    low_52 = float(close.tail(252).min()) if len(close) else price
+
+    supports = unique_levels(
+        [
+            low.tail(20).min(),
+            low.tail(50).min(),
+            sma50.iloc[-1] if pd.notna(sma50.iloc[-1]) else None,
+            sma200.iloc[-1] if pd.notna(sma200.iloc[-1]) else None,
+            low_52,
+            price - (safe_float(atr.iloc[-1]) or price * 0.03) * 1.5,
+        ],
+        price,
+        "support",
+    )
+    resistances = unique_levels(
+        [
+            high.tail(20).max(),
+            high.tail(50).max(),
+            high_52,
+            price + (safe_float(atr.iloc[-1]) or price * 0.03) * 2,
+            price * 1.08,
+        ],
+        price,
+        "resistance",
+    )
+
+    latest_rsi = safe_float(rsi.iloc[-1], 50) or 50
+    latest_macd = safe_float(macd.iloc[-1], 0) or 0
+    latest_signal = safe_float(macd_signal.iloc[-1], 0) or 0
+    latest_hist = safe_float(macd_hist.iloc[-1], 0) or 0
+    prior_hist = safe_float(macd_hist.iloc[-5], latest_hist) if len(macd_hist) >= 5 else latest_hist
+    atr_value = safe_float(atr.iloc[-1])
+    atr_pct = atr_value / price if atr_value else None
+    avg_vol20 = safe_float(volume.tail(20).mean(), 0) or 0
+    avg_vol50 = safe_float(volume.tail(50).mean(), 0) or 0
+    latest_volume = safe_float(volume.iloc[-1], 0) or 0
+    volume_ratio = latest_volume / avg_vol20 if avg_vol20 else None
+
+    ema20_now = safe_float(ema20.iloc[-1], price) or price
+    ema50_now = safe_float(ema50.iloc[-1], price) or price
+    sma200_now = safe_float(sma200.iloc[-1], price) or price
+    sma50_now = safe_float(sma50.iloc[-1], price) or price
+    sma50_past = safe_float(sma50.iloc[-20], sma50_now) if len(sma50) > 20 else sma50_now
+
+    trend_score = 0
+    trend_score += 4 if price > ema20_now else 1
+    trend_score += 4 if price > ema50_now else 1
+    trend_score += 4 if price > sma200_now else 1
+    trend_score += 4 if ema20_now > ema50_now else 1
+    trend_score += 2 if ema50_now > sma200_now else 0
+    trend_score += 2 if sma50_now >= sma50_past else 0
+
+    momentum_score = 0
+    if 50 <= latest_rsi <= 68:
+        momentum_score += 7
+    elif 40 <= latest_rsi < 50 or 68 < latest_rsi <= 75:
+        momentum_score += 5
+    elif 30 <= latest_rsi < 40 or 75 < latest_rsi <= 82:
+        momentum_score += 3
+    else:
+        momentum_score += 1
+    momentum_score += 5 if latest_macd > latest_signal else 1
+    momentum_score += 3 if latest_hist > prior_hist else 1
+    momentum_score += 3 if (ret_1m or 0) > 0 else 1
+    momentum_score += 2 if (ret_3m or 0) > 0 else 0
+
+    volume_score = 9
+    day_positive = price >= previous
+    if volume_ratio is not None:
+        if volume_ratio >= 1.4 and day_positive:
+            volume_score += 5
+        elif volume_ratio >= 1.0:
+            volume_score += 3
+        elif volume_ratio < 0.55:
+            volume_score -= 2
+    if avg_vol20 and avg_vol50 and avg_vol20 >= avg_vol50:
+        volume_score += 3
+    if (ret_1m or 0) > 0 and volume_ratio and volume_ratio >= 0.8:
+        volume_score += 3
+    if latest_volume * price > 1_000_000_000:
+        volume_score += 2
+
+    nearest_support = supports[0] if supports else price * 0.92
+    nearest_resistance = resistances[0] if resistances else price * 1.10
+    support_distance = (price - nearest_support) / price
+    resistance_distance = (nearest_resistance - price) / price
+    risk_reward = resistance_distance / support_distance if support_distance > 0 else 1
+
+    pattern_score = 7
+    if price > sma200_now:
+        pattern_score += 3
+    if support_distance <= 0.08:
+        pattern_score += 4
+    if high_52 and price / high_52 >= 0.92:
+        pattern_score += 3
+    if risk_reward >= 1.8:
+        pattern_score += 3
+    if (drawdown or -1) > -0.35:
+        pattern_score += 2
+
+    relative_score = 10
+    nifty_1m, nifty_3m, nifty_6m = None, None, None
+    try:
+        nifty = fetch_symbol_bundle("^NSEI")["history"]["Close"].astype(float)
+        nifty_1m = pct_return(nifty, 21)
+        nifty_3m = pct_return(nifty, 63)
+        nifty_6m = pct_return(nifty, 126)
+    except Exception:
+        pass
+    for stock_ret, index_ret in [(ret_1m, nifty_1m), (ret_3m, nifty_3m), (ret_6m, nifty_6m)]:
+        if stock_ret is None or index_ret is None:
+            continue
+        relative_score += 3 if stock_ret > index_ret else -2
+    if (ret_1y or 0) > 0:
+        relative_score += 2
+
+    sub_scores = {
+        "Trend": sub_score(trend_score, 20, "Moving-average alignment and slope."),
+        "Momentum": sub_score(momentum_score, 20, f"RSI {latest_rsi:.1f}, MACD {'above' if latest_macd > latest_signal else 'below'} signal."),
+        "Volume": sub_score(volume_score, 20, f"Latest volume is {volume_ratio:.2f}x the 20-day average." if volume_ratio else "Volume history is limited."),
+        "Pattern": sub_score(pattern_score, 20, f"Nearest support is {fmt_price(nearest_support)} and resistance is {fmt_price(nearest_resistance)}."),
+        "Relative Strength": sub_score(relative_score, 20, "Performance compared with Nifty 50 where data is available."),
+    }
+    score = sum(item["score"] for item in sub_scores.values())
+
+    if score >= 70:
+        label = "Bullish"
+    elif score >= 50:
+        label = "Neutral"
+    else:
+        label = "Bearish"
+
+    bullets = [
+        f"Price is {fmt_price(price)} versus EMA20 {fmt_price(ema20_now)}, EMA50 {fmt_price(ema50_now)}, and SMA200 {fmt_price(sma200_now)}.",
+        f"Momentum reads RSI {latest_rsi:.1f}; MACD is {'confirming' if latest_macd > latest_signal else 'not confirming'} the trend.",
+        f"One-month return is {fmt_pct(ret_1m)} and six-month return is {fmt_pct(ret_6m)}.",
+        f"ATR is {fmt_pct(atr_pct)} of price, useful for stop placement and position sizing." if atr_pct else "ATR data is unavailable, so stop placement is more approximate.",
+    ]
+
+    details = {
+        "price": price,
+        "previous_close": previous,
+        "day_change": price - previous,
+        "day_change_pct": (price / previous - 1) if previous else None,
+        "ema20": ema20_now,
+        "ema50": ema50_now,
+        "sma200": sma200_now,
+        "rsi": latest_rsi,
+        "macd": latest_macd,
+        "macd_signal": latest_signal,
+        "atr": atr_value,
+        "atr_pct": atr_pct,
+        "volume_ratio": volume_ratio,
+        "avg_volume_20": avg_vol20,
+        "avg_volume_50": avg_vol50,
+        "returns": {
+            "1M": ret_1m,
+            "3M": ret_3m,
+            "6M": ret_6m,
+            "1Y": ret_1y,
+        },
+        "annualized_volatility": realized_volatility,
+        "support": supports,
+        "resistance": resistances,
+        "risk_reward": risk_reward,
+        "max_drawdown": drawdown,
+        "high_52": high_52,
+        "low_52": low_52,
+    }
+    summary = (
+        f"Technical setup is {label.lower()} with a {score}/100 score. "
+        f"The model sees risk/reward near {risk_reward:.1f}:1 based on nearest support and resistance."
+    )
+    return ScoreBlock(score=score, label=label, summary=summary, sub_scores=sub_scores, bullets=bullets, details=details)
+
+
+def analyze_fundamental(info: Dict[str, Any], technical: ScoreBlock) -> ScoreBlock:
+    pe = safe_float(info.get("trailingPE")) or safe_float(info.get("forwardPE"))
+    forward_pe = safe_float(info.get("forwardPE"))
+    pb = safe_float(info.get("priceToBook"))
+    peg = safe_float(info.get("pegRatio"))
+    ev_ebitda = safe_float(info.get("enterpriseToEbitda"))
+    revenue_growth = safe_float(info.get("revenueGrowth"))
+    earnings_growth = safe_float(info.get("earningsGrowth"))
+    gross_margin = safe_float(info.get("grossMargins"))
+    operating_margin = safe_float(info.get("operatingMargins"))
+    net_margin = safe_float(info.get("profitMargins"))
+    roe = safe_float(info.get("returnOnEquity"))
+    fcf = safe_float(info.get("freeCashflow"))
+    debt_to_equity = as_inr_debt_to_equity(info.get("debtToEquity"))
+    current_ratio = safe_float(info.get("currentRatio"))
+    total_cash = safe_float(info.get("totalCash"))
+    total_debt = safe_float(info.get("totalDebt"))
+    market_cap = safe_float(info.get("marketCap"))
+    sector = info.get("sector") or "Data unavailable"
+    dividend_yield = safe_float(info.get("dividendYield"))
+
+    valuation_score = 10
+    if pe is not None and pe > 0:
+        if pe < 15:
+            valuation_score += 7
+        elif pe < 25:
+            valuation_score += 5
+        elif pe < 40:
+            valuation_score += 3
+        elif pe < 65:
+            valuation_score += 1
+        else:
+            valuation_score -= 4
+    elif pe is not None and pe <= 0:
+        valuation_score -= 5
+    if pb is not None:
+        valuation_score += 3 if pb < 3 else 1 if pb < 7 else -2
+    if ev_ebitda is not None:
+        valuation_score += 3 if ev_ebitda < 14 else 1 if ev_ebitda < 25 else -2
+    if peg is not None and peg > 0:
+        valuation_score += 2 if peg < 1.5 else -1 if peg > 3 else 0
+
+    growth_score = 8
+    if revenue_growth is not None:
+        growth_score += 7 if revenue_growth > 0.20 else 5 if revenue_growth > 0.10 else 3 if revenue_growth > 0.03 else -2 if revenue_growth < 0 else 1
+    if earnings_growth is not None:
+        growth_score += 7 if earnings_growth > 0.20 else 5 if earnings_growth > 0.10 else 3 if earnings_growth > 0.03 else -3 if earnings_growth < 0 else 1
+    if (technical.details["returns"].get("1Y") or 0) > 0.10:
+        growth_score += 2
+
+    profitability_score = 6
+    if gross_margin is not None:
+        profitability_score += 3 if gross_margin > 0.45 else 2 if gross_margin > 0.25 else 1 if gross_margin > 0.10 else 0
+    if operating_margin is not None:
+        profitability_score += 5 if operating_margin > 0.25 else 4 if operating_margin > 0.15 else 2 if operating_margin > 0.07 else -2
+    if net_margin is not None:
+        profitability_score += 4 if net_margin > 0.18 else 3 if net_margin > 0.10 else 1 if net_margin > 0.03 else -2
+    if roe is not None:
+        profitability_score += 4 if roe > 0.20 else 3 if roe > 0.12 else 1 if roe > 0.05 else -2
+    if fcf is not None:
+        profitability_score += 2 if fcf > 0 else -2
+
+    health_score = 8
+    if debt_to_equity is not None:
+        health_score += 5 if debt_to_equity < 0.4 else 3 if debt_to_equity < 0.9 else 1 if debt_to_equity < 1.5 else -3
+    if current_ratio is not None:
+        health_score += 4 if current_ratio >= 1.5 else 2 if current_ratio >= 1.0 else -2
+    if total_cash is not None and total_debt is not None:
+        health_score += 4 if total_cash >= total_debt else 1 if total_cash >= total_debt * 0.5 else -2
+    if fcf is not None:
+        health_score += 3 if fcf > 0 else -2
+
+    moat_score = 8
+    if market_cap is not None:
+        moat_score += 4 if market_cap >= 1_000_000_000_000 else 3 if market_cap >= 300_000_000_000 else 1
+    if roe is not None and roe > 0.15:
+        moat_score += 3
+    if operating_margin is not None and operating_margin > 0.15:
+        moat_score += 3
+    if revenue_growth is not None and revenue_growth > 0.08:
+        moat_score += 2
+    if sector in {"Consumer Defensive", "Technology", "Healthcare"}:
+        moat_score += 1
+
+    sub_scores = {
+        "Valuation": sub_score(valuation_score, 20, f"P/E {fmt_ratio(pe)}; P/B {fmt_ratio(pb)}; EV/EBITDA {fmt_ratio(ev_ebitda)}."),
+        "Growth": sub_score(growth_score, 20, f"Revenue growth {fmt_pct(revenue_growth)}; earnings growth {fmt_pct(earnings_growth)}."),
+        "Profitability": sub_score(profitability_score, 20, f"Operating margin {fmt_pct(operating_margin)}; ROE {fmt_pct(roe)}."),
+        "Financial Health": sub_score(health_score, 20, f"Debt/equity {fmt_ratio(debt_to_equity)}; current ratio {fmt_ratio(current_ratio)}."),
+        "Moat Strength": sub_score(moat_score, 20, f"Moat proxy uses scale, returns, margins, and sector durability."),
+    }
+    score = sum(item["score"] for item in sub_scores.values())
+    label = "Strong" if score >= 70 else "Adequate" if score >= 50 else "Weak"
+
+    bullets = [
+        f"Valuation: trailing/forward P/E is {fmt_ratio(pe)} / {fmt_ratio(forward_pe)} and P/B is {fmt_ratio(pb)}.",
+        f"Growth: revenue growth is {fmt_pct(revenue_growth)} and earnings growth is {fmt_pct(earnings_growth)} where reported.",
+        f"Profitability: operating margin is {fmt_pct(operating_margin)}, net margin is {fmt_pct(net_margin)}, and ROE is {fmt_pct(roe)}.",
+        f"Balance sheet: debt/equity is {fmt_ratio(debt_to_equity)} with current ratio {fmt_ratio(current_ratio)}.",
+    ]
+    details = {
+        "pe": pe,
+        "forward_pe": forward_pe,
+        "pb": pb,
+        "peg": peg,
+        "ev_ebitda": ev_ebitda,
+        "revenue_growth": revenue_growth,
+        "earnings_growth": earnings_growth,
+        "gross_margin": gross_margin,
+        "operating_margin": operating_margin,
+        "net_margin": net_margin,
+        "roe": roe,
+        "fcf": fcf,
+        "debt_to_equity": debt_to_equity,
+        "current_ratio": current_ratio,
+        "total_cash": total_cash,
+        "total_debt": total_debt,
+        "market_cap": market_cap,
+        "sector": sector,
+        "dividend_yield": dividend_yield,
+    }
+    summary = (
+        f"Fundamentals are {label.lower()} at {score}/100. "
+        f"The strongest drivers are {', '.join(top_sub_scores(sub_scores, 2))}."
+    )
+    return ScoreBlock(score=score, label=label, summary=summary, sub_scores=sub_scores, bullets=bullets, details=details)
+
+
+def analyze_sentiment(info: Dict[str, Any], news: List[Dict[str, Any]], technical: ScoreBlock) -> ScoreBlock:
+    news_items = extract_news_items(news)
+    positive_count = sum(1 for item in news_items if item["tone"] == "Positive")
+    negative_count = sum(1 for item in news_items if item["tone"] == "Negative")
+    neutral_count = sum(1 for item in news_items if item["tone"] == "Neutral")
+
+    if news_items:
+        news_score = 10 + (positive_count - negative_count) * 3
+        news_assessment = f"{positive_count} positive, {neutral_count} neutral, {negative_count} negative Yahoo Finance headlines."
+    else:
+        news_score = 10
+        news_assessment = "No recent Yahoo Finance headlines were returned; score kept neutral."
+
+    one_month = technical.details["returns"].get("1M")
+    volume_ratio = technical.details.get("volume_ratio")
+    social_score = 10
+    if one_month is not None:
+        social_score += 4 if one_month > 0.10 else 2 if one_month > 0.03 else -3 if one_month < -0.08 else 0
+    if volume_ratio is not None:
+        social_score += 3 if volume_ratio > 1.5 else 1 if volume_ratio > 1.0 else -1 if volume_ratio < 0.5 else 0
+
+    recommendation = info.get("recommendationKey") or info.get("recommendationMean")
+    target_mean = safe_float(info.get("targetMeanPrice"))
+    price = technical.details["price"]
+    target_upside = (target_mean / price - 1) if target_mean and price else None
+    analyst_score = 10
+    if isinstance(recommendation, str):
+        rec = recommendation.lower()
+        analyst_score += 6 if "buy" in rec and "strong" in rec else 4 if "buy" in rec else -3 if "sell" in rec else 0
+    if target_upside is not None:
+        analyst_score += 5 if target_upside > 0.20 else 3 if target_upside > 0.08 else -3 if target_upside < -0.05 else 0
+
+    institutional_pct = safe_float(info.get("heldPercentInstitutions"))
+    insider_pct = safe_float(info.get("heldPercentInsiders"))
+    inst_score = 10
+    if institutional_pct is not None:
+        inst_score += 5 if institutional_pct > 0.45 else 3 if institutional_pct > 0.20 else 0
+    if info.get("floatShares") and info.get("sharesOutstanding"):
+        float_pct = safe_float(info.get("floatShares")) / safe_float(info.get("sharesOutstanding")) if safe_float(info.get("sharesOutstanding")) else None
+        if float_pct is not None and float_pct > 0.45:
+            inst_score += 2
+
+    shares_short = safe_float(info.get("sharesShort"))
+    short_ratio = safe_float(info.get("shortRatio"))
+    insider_short_score = 10
+    if insider_pct is not None:
+        insider_short_score += 3 if 0.02 <= insider_pct <= 0.25 else 1 if insider_pct > 0 else 0
+    if short_ratio is not None:
+        insider_short_score += 3 if short_ratio < 2 else -3 if short_ratio > 7 else 0
+    if shares_short is None and short_ratio is None:
+        insider_short_score += 0
+
+    sub_scores = {
+        "News Sentiment": sub_score(news_score, 20, news_assessment),
+        "Social Buzz Proxy": sub_score(social_score, 20, "Uses one-month return and volume spike as a public-attention proxy."),
+        "Analyst Consensus": sub_score(analyst_score, 20, f"Recommendation {recommendation or 'unavailable'}; target upside {fmt_pct(target_upside)}."),
+        "Institutional Activity": sub_score(inst_score, 20, f"Institutional holding {fmt_pct(institutional_pct)} where available."),
+        "Insider / Short": sub_score(insider_short_score, 20, f"Insider holding {fmt_pct(insider_pct)}; short ratio {fmt_ratio(short_ratio)}."),
+    }
+    score = sum(item["score"] for item in sub_scores.values())
+    label = "Bullish" if score >= 70 else "Neutral" if score >= 50 else "Bearish"
+
+    bullets = [
+        news_assessment,
+        f"Analyst signal: recommendation is {recommendation or 'data unavailable'} and target upside is {fmt_pct(target_upside)}.",
+        f"Momentum proxy: one-month return {fmt_pct(one_month)} with volume at {volume_ratio:.2f}x normal." if volume_ratio else f"Momentum proxy: one-month return {fmt_pct(one_month)}.",
+        "For Indian equities, social-media and insider/short data can be sparse in free public feeds; missing data is scored neutrally.",
+    ]
+    details = {
+        "news_items": news_items,
+        "positive_news": positive_count,
+        "negative_news": negative_count,
+        "neutral_news": neutral_count,
+        "recommendation": recommendation,
+        "target_mean": target_mean,
+        "target_upside": target_upside,
+        "institutional_pct": institutional_pct,
+        "insider_pct": insider_pct,
+        "short_ratio": short_ratio,
+    }
+    summary = (
+        f"Sentiment is {label.lower()} at {score}/100. "
+        f"The model gives more weight to current headlines, analyst target upside, and volume-confirmed attention."
+    )
+    return ScoreBlock(score=score, label=label, summary=summary, sub_scores=sub_scores, bullets=bullets, details=details)
+
+
+def analyze_risk(info: Dict[str, Any], technical: ScoreBlock, fundamental: ScoreBlock) -> ScoreBlock:
+    price = technical.details["price"]
+    beta = safe_float(info.get("beta"))
+    sector = info.get("sector") or "Data unavailable"
+    annual_vol = annualized_volatility_from_details(technical)
+    atr_pct = technical.details.get("atr_pct")
+    drawdown = technical.details.get("max_drawdown")
+    avg_volume_20 = technical.details.get("avg_volume_20")
+    rupee_volume = (avg_volume_20 or 0) * price
+    debt_to_equity = fundamental.details.get("debt_to_equity")
+
+    volatility_score = 20
+    if annual_vol is not None:
+        volatility_score = 20 if annual_vol < 0.22 else 16 if annual_vol < 0.32 else 12 if annual_vol < 0.45 else 8 if annual_vol < 0.65 else 4
+    if beta is not None and beta > 1.3:
+        volatility_score -= 3
+    if atr_pct is not None and atr_pct > 0.05:
+        volatility_score -= 2
+
+    dd = drawdown if drawdown is not None else -0.30
+    downside_score = 20 if dd > -0.15 else 16 if dd > -0.25 else 12 if dd > -0.40 else 7 if dd > -0.55 else 3
+    if technical.details.get("price", 0) < technical.details.get("sma200", 0):
+        downside_score -= 2
+
+    sector_cyc = SECTOR_CYCLICALITY.get(str(sector), 0.50)
+    macro_score = 20 - int(sector_cyc * 12)
+    if beta is not None:
+        macro_score += 2 if beta < 0.8 else -3 if beta > 1.25 else 0
+    if debt_to_equity is not None:
+        macro_score += 2 if debt_to_equity < 0.5 else -2 if debt_to_equity > 1.2 else 0
+
+    liquidity_score = 3
+    if rupee_volume > 5_000_000_000:
+        liquidity_score = 20
+    elif rupee_volume > 1_000_000_000:
+        liquidity_score = 16
+    elif rupee_volume > 250_000_000:
+        liquidity_score = 12
+    elif rupee_volume > 50_000_000:
+        liquidity_score = 7
+
+    rr = technical.details.get("risk_reward") or 1
+    rr_score = 20 if rr >= 3 else 16 if rr >= 2 else 12 if rr >= 1.3 else 7 if rr >= 0.8 else 3
+    if fundamental.score < 45:
+        rr_score -= 2
+
+    sub_scores = {
+        "Volatility": sub_score(volatility_score, 20, f"Annualized 90-day volatility {fmt_pct(annual_vol)}; beta {fmt_ratio(beta)}."),
+        "Downside Protection": sub_score(downside_score, 20, f"Two-year max drawdown {fmt_pct(dd)}."),
+        "Macro Resilience": sub_score(macro_score, 20, f"Sector cyclicality proxy for {sector}; debt/equity {fmt_ratio(debt_to_equity)}."),
+        "Liquidity": sub_score(liquidity_score, 20, f"20-day average traded value about {fmt_money(rupee_volume)}."),
+        "Risk / Reward": sub_score(rr_score, 20, f"Nearest-level risk/reward is about {rr:.1f}:1."),
+    }
+    score = sum(item["score"] for item in sub_scores.values())
+    label = "Low" if score >= 75 else "Moderate" if score >= 55 else "High" if score >= 35 else "Extreme"
+
+    stop_loss = derive_stop_loss(technical)
+    entry_mid = technical.details["price"]
+    risk_per_share = max(entry_mid - stop_loss, entry_mid * 0.01)
+    portfolio_size = 500_000
+    shares_for_2pct = int((portfolio_size * 0.02) / risk_per_share) if risk_per_share > 0 else 0
+
+    bullets = [
+        f"Risk score is inverted: higher means safer. Current risk level is {label.lower()} at {score}/100.",
+        f"Estimated stop level is {fmt_price(stop_loss)}, based on nearby support and ATR.",
+        f"At a sample INR 5 lakh portfolio and 2% risk, position size is about {shares_for_2pct} shares before liquidity checks.",
+        f"Average traded value is {fmt_money(rupee_volume)}, which drives the liquidity score.",
+    ]
+    details = {
+        "annual_volatility": annual_vol,
+        "beta": beta,
+        "atr_pct": atr_pct,
+        "drawdown": drawdown,
+        "rupee_volume": rupee_volume,
+        "stop_loss": stop_loss,
+        "risk_per_share": risk_per_share,
+        "sample_position_shares": shares_for_2pct,
+        "risk_level": label,
+        "key_risks": build_key_risks(info, technical, fundamental),
+    }
+    summary = (
+        f"Risk profile is {label.lower()} with a {score}/100 safety score. "
+        "The main risk drivers are volatility, drawdown history, liquidity, leverage, and current risk/reward."
+    )
+    return ScoreBlock(score=score, label=label, summary=summary, sub_scores=sub_scores, bullets=bullets, details=details)
+
+
+def annualized_volatility_from_details(technical: ScoreBlock) -> Optional[float]:
+    realized = technical.details.get("annualized_volatility")
+    if realized is not None:
+        return realized
+    # If unavailable here, estimate from ATR as a conservative fallback.
+    atr_pct = technical.details.get("atr_pct")
+    if atr_pct is None:
+        return None
+    return min(1.2, atr_pct * math.sqrt(252))
+
+
+def derive_stop_loss(technical: ScoreBlock) -> float:
+    price = technical.details["price"]
+    support = technical.details.get("support") or []
+    atr = technical.details.get("atr")
+    candidates = []
+    if support:
+        candidates.append(support[0] * 0.985)
+    if atr:
+        candidates.append(price - 1.5 * atr)
+    candidates.append(price * 0.92)
+    stop = max([candidate for candidate in candidates if candidate < price], default=price * 0.92)
+    return float(stop)
+
+
+def build_key_risks(info: Dict[str, Any], technical: ScoreBlock, fundamental: ScoreBlock) -> List[Dict[str, str]]:
+    risks: List[Dict[str, str]] = []
+    sector = info.get("sector") or "sector"
+    if (technical.details.get("max_drawdown") or 0) < -0.35:
+        risks.append(
+            {
+                "risk": "Large historical drawdowns",
+                "probability": "Medium",
+                "impact": "High",
+                "mitigation": "Use a defined stop and avoid oversizing.",
+            }
+        )
+    if (fundamental.details.get("debt_to_equity") or 0) > 1.2:
+        risks.append(
+            {
+                "risk": "Elevated leverage",
+                "probability": "Medium",
+                "impact": "High",
+                "mitigation": "Track interest coverage, refinancing news, and cash flow trends.",
+            }
+        )
+    if fundamental.score < 50:
+        risks.append(
+            {
+                "risk": "Weak or mixed fundamentals",
+                "probability": "Medium",
+                "impact": "Medium",
+                "mitigation": "Wait for earnings confirmation or valuation improvement.",
+            }
+        )
+    if technical.score < 50:
+        risks.append(
+            {
+                "risk": "Technical trend is not supportive",
+                "probability": "Medium",
+                "impact": "Medium",
+                "mitigation": "Wait for price to reclaim moving averages with volume.",
+            }
+        )
+    risks.append(
+        {
+            "risk": f"{sector} macro sensitivity",
+            "probability": "Medium",
+            "impact": "Medium",
+            "mitigation": "Compare performance against Nifty and sector index during market stress.",
+        }
+    )
+    risks.append(
+        {
+            "risk": "Data-source limitations",
+            "probability": "Medium",
+            "impact": "Medium",
+            "mitigation": "Validate financials, insider data, and corporate actions with NSE/BSE filings.",
+        }
+    )
+    return risks[:5]
+
+
+def analyze_thesis(
+    info: Dict[str, Any],
+    technical: ScoreBlock,
+    fundamental: ScoreBlock,
+    sentiment: ScoreBlock,
+    risk: ScoreBlock,
+    next_earnings: str,
+) -> ScoreBlock:
+    catalyst_score = 8
+    if next_earnings != "Data unavailable":
+        catalyst_score += 4
+    if sentiment.details.get("news_items"):
+        catalyst_score += 3
+    if (fundamental.details.get("revenue_growth") or 0) > 0.08:
+        catalyst_score += 3
+    if (sentiment.details.get("target_upside") or 0) > 0.10:
+        catalyst_score += 2
+
+    timing_score = technical.score / 5
+    asymmetry_score = clamp((technical.details.get("risk_reward") or 1) * 6, 4, 20)
+    edge_score = (fundamental.score * 0.35 + sentiment.score * 0.25 + technical.score * 0.20 + risk.score * 0.20) / 5
+    conviction_score = (technical.score + fundamental.score + sentiment.score + risk.score) / 20
+
+    sub_scores = {
+        "Catalyst Clarity": sub_score(catalyst_score, 20, f"Next earnings: {next_earnings}; news/catalyst data included where available."),
+        "Timing": sub_score(timing_score, 20, f"Mapped from technical score {technical.score}/100."),
+        "Asymmetry": sub_score(asymmetry_score, 20, f"Risk/reward around {technical.details.get('risk_reward', 1):.1f}:1."),
+        "Analytical Edge": sub_score(edge_score, 20, "Blend of fundamental quality, sentiment support, technical posture, and risk."),
+        "Conviction": sub_score(conviction_score, 20, "Cross-check of all four evidence blocks."),
+    }
+    score = sum(item["score"] for item in sub_scores.values())
+    label = "Strong" if score >= 70 else "Moderate" if score >= 50 else "Weak"
+
+    bull = build_bull_case(technical, fundamental, sentiment)
+    bear = build_bear_case(technical, fundamental, sentiment, risk)
+    price = technical.details["price"]
+    stop = risk.details["stop_loss"]
+    resistance = technical.details.get("resistance") or [price * 1.08, price * 1.16]
+    target_1 = resistance[0] if resistance else price * 1.08
+    target_2 = resistance[1] if len(resistance) > 1 else price * 1.16
+    timeframe = "Position trade" if fundamental.score >= 60 else "Swing trade"
+
+    bullets = [
+        f"Core thesis is {label.lower()}: composite evidence supports a {timeframe.lower()} setup if price respects risk levels.",
+        f"Bull target zone begins near {fmt_price(target_1)}; extended target is {fmt_price(target_2)}.",
+        f"Invalidation begins below {fmt_price(stop)} or if the next earnings update weakens the fundamental trend.",
+        "The thesis should be reviewed after earnings, major sector news, or a decisive break of support/resistance.",
+    ]
+    details = {
+        "bull_case": bull,
+        "bear_case": bear,
+        "entry_zone": derive_entry_zone(technical),
+        "stop_loss": stop,
+        "target_1": target_1,
+        "target_2": target_2,
+        "timeframe": timeframe,
+        "catalysts": build_catalysts(next_earnings, sentiment, fundamental),
+    }
+    summary = (
+        f"Thesis conviction is {label.lower()} at {score}/100. "
+        "The decision quality depends on catalyst visibility, timing, asymmetry, and whether the risk controls are acceptable."
+    )
+    return ScoreBlock(score=score, label=label, summary=summary, sub_scores=sub_scores, bullets=bullets, details=details)
+
+
+def build_bull_case(technical: ScoreBlock, fundamental: ScoreBlock, sentiment: ScoreBlock) -> List[str]:
+    factors = []
+    if technical.score >= 60:
+        factors.append("Trend and momentum are supportive, with price respecting key moving-average structure.")
+    if fundamental.score >= 60:
+        factors.append("Fundamental quality is acceptable to strong across growth, profitability, balance sheet, or moat proxies.")
+    if sentiment.score >= 60:
+        factors.append("Sentiment inputs lean constructive, supported by headlines, analyst target upside, or attention proxies.")
+    if (fundamental.details.get("revenue_growth") or 0) > 0.08:
+        factors.append("Revenue growth remains a potential catalyst if upcoming results confirm the trajectory.")
+    if (technical.details.get("risk_reward") or 0) >= 1.5:
+        factors.append("Nearest support and resistance create a favorable enough risk/reward map for a controlled setup.")
+    return (factors or ["Bull case depends on renewed momentum, cleaner fundamentals, and confirmation from earnings."])[:5]
+
+
+def build_bear_case(
+    technical: ScoreBlock,
+    fundamental: ScoreBlock,
+    sentiment: ScoreBlock,
+    risk: ScoreBlock,
+) -> List[str]:
+    factors = []
+    if technical.score < 55:
+        factors.append("Technical confirmation is incomplete; weak momentum can lead to failed breakouts or sideways action.")
+    if fundamental.score < 55:
+        factors.append("Fundamental score is mixed, leaving less margin for valuation or earnings disappointment.")
+    if sentiment.score < 55:
+        factors.append("Sentiment support is limited or mixed, so positive news flow may not be enough to re-rate the stock.")
+    if risk.score < 55:
+        factors.append("Risk profile is elevated based on volatility, drawdown, liquidity, leverage, or poor asymmetry.")
+    factors.append("A broad market sell-off or sector-specific shock can invalidate the setup even if company data is stable.")
+    return factors[:5]
+
+
+def build_catalysts(next_earnings: str, sentiment: ScoreBlock, fundamental: ScoreBlock) -> List[Dict[str, str]]:
+    catalysts = []
+    catalysts.append(
+        {
+            "date": next_earnings,
+            "event": "Next earnings / results update",
+            "impact": "High if management confirms margin, growth, or guidance trend.",
+        }
+    )
+    if sentiment.details.get("news_items"):
+        first = sentiment.details["news_items"][0]
+        catalysts.append(
+            {
+                "date": first.get("published") or "Recent",
+                "event": first.get("title", "Recent company news"),
+                "impact": f"{first.get('tone', 'Neutral')} near-term sentiment input.",
+            }
+        )
+    catalysts.append(
+        {
+            "date": "Ongoing",
+            "event": "Sector and Nifty relative strength",
+            "impact": "Supports the thesis if the stock outperforms the broader market.",
+        }
+    )
+    if (fundamental.details.get("dividend_yield") or 0) > 0:
+        catalysts.append(
+            {
+                "date": "Ongoing",
+                "event": "Dividend and capital-return profile",
+                "impact": f"Dividend yield reported at {fmt_pct(fundamental.details.get('dividend_yield'))}.",
+            }
+        )
+    return catalysts[:4]
+
+
+def derive_entry_zone(technical: ScoreBlock) -> Tuple[float, float]:
+    price = technical.details["price"]
+    supports = technical.details.get("support") or []
+    atr = technical.details.get("atr") or price * 0.03
+    lower = max(supports[0] if supports else price - atr, price - atr * 1.2)
+    upper = min(price + atr * 0.4, price * 1.025)
+    if lower >= upper:
+        lower = price * 0.985
+        upper = price * 1.015
+    return float(lower), float(upper)
+
+
+def top_sub_scores(sub_scores: Dict[str, Dict[str, Any]], count: int = 2) -> List[str]:
+    ordered = sorted(sub_scores.items(), key=lambda pair: pair[1]["score"], reverse=True)
+    return [name for name, _ in ordered[:count]]
+
+
+def build_report(query: str) -> Dict[str, Any]:
+    bundle = load_stock_bundle(query)
+    info = bundle["info"]
+    history = bundle["history"]
+    symbol = bundle["symbol"]
+
+    technical = analyze_technical(history, info)
+    fundamental = analyze_fundamental(info, technical)
+    sentiment = analyze_sentiment(info, bundle["news"], technical)
+    risk = analyze_risk(info, technical, fundamental)
+    next_earnings = infer_next_earnings(bundle["calendar"])
+    thesis = analyze_thesis(info, technical, fundamental, sentiment, risk, next_earnings)
+
+    dimension_scores = {
+        "technical": technical.score,
+        "fundamental": fundamental.score,
+        "sentiment": sentiment.score,
+        "risk": risk.score,
+        "thesis": thesis.score,
+    }
+    composite = round(sum(dimension_scores[key] * WEIGHTS[key] for key in WEIGHTS))
+    grade = score_to_grade(composite)
+    signal = score_to_signal(composite)
+    company_name = info.get("longName") or info.get("shortName") or symbol
+    currency = info.get("currency") or "INR"
+    price = technical.details["price"]
+
+    executive_summary = [
+        (
+            f"{company_name} ({symbol}) receives a composite score of {composite}/100, "
+            f"which maps to grade {grade} and signal '{signal}'. The score combines "
+            "technical strength, fundamental quality, sentiment, risk profile, and thesis conviction using the uploaded trading-rubric weights."
+        ),
+        (
+            f"The current price is {fmt_price(price, currency)}. Technicals are {technical.label.lower()}, "
+            f"fundamentals are {fundamental.label.lower()}, sentiment is {sentiment.label.lower()}, "
+            f"and the risk layer is {risk.label.lower()}."
+        ),
+        (
+            "This is a structured research output, not a trade instruction. The useful next step is to verify financial statements, corporate filings, and the latest NSE/BSE announcements before acting."
+        ),
+    ]
+
+    return {
+        "query": query,
+        "symbol": symbol,
+        "company_name": company_name,
+        "exchange": info.get("exchange") or "NSE/BSE",
+        "sector": info.get("sector") or "Data unavailable",
+        "industry": info.get("industry") or "Data unavailable",
+        "currency": currency,
+        "retrieved_at": bundle["retrieved_at"],
+        "next_earnings": next_earnings,
+        "price": price,
+        "market_cap": safe_float(info.get("marketCap")),
+        "avg_volume": technical.details.get("avg_volume_20"),
+        "fifty_two_week": (technical.details.get("low_52"), technical.details.get("high_52")),
+        "dimension_scores": dimension_scores,
+        "composite": composite,
+        "grade": grade,
+        "signal": signal,
+        "tone": score_tone(composite),
+        "executive_summary": executive_summary,
+        "technical": technical,
+        "fundamental": fundamental,
+        "sentiment": sentiment,
+        "risk": risk,
+        "thesis": thesis,
+        "disclaimer": DISCLAIMER,
+    }
+
+
+def html_escape(text: Any) -> str:
+    return escape(str(text))
+
+
+def render_subscore_table(block: ScoreBlock) -> str:
+    rows = []
+    for name, item in block.sub_scores.items():
+        pct = item["score"] / item["max"] * 100 if item["max"] else 0
+        rows.append(
+            f"""
+            <tr>
+                <td>{html_escape(name)}</td>
+                <td><strong>{item['score']}/{item['max']}</strong></td>
+                <td>
+                    <div class="bar"><span style="width:{pct:.0f}%"></span></div>
+                </td>
+                <td>{html_escape(item['assessment'])}</td>
+            </tr>
+            """
+        )
+    return "\n".join(rows)
+
+
+def render_bullets(items: Iterable[Any]) -> str:
+    return "\n".join(f"<li>{html_escape(item)}</li>" for item in items)
+
+
+def render_score_cards(report: Dict[str, Any]) -> str:
+    labels = {
+        "technical": "Technical Strength",
+        "fundamental": "Fundamental Quality",
+        "sentiment": "Sentiment & Momentum",
+        "risk": "Risk Profile",
+        "thesis": "Thesis Conviction",
+    }
+    cards = []
+    for key, label in labels.items():
+        score = report["dimension_scores"][key]
+        cards.append(
+            f"""
+            <section class="metric">
+                <span>{label}</span>
+                <strong>{score}</strong>
+                <div class="bar"><span style="width:{score}%"></span></div>
+                <small>Weight {int(WEIGHTS[key] * 100)}%</small>
+            </section>
+            """
+        )
+    return "\n".join(cards)
+
+
+def render_levels(levels: List[float], currency: str) -> str:
+    if not levels:
+        return "Data unavailable"
+    return ", ".join(fmt_price(level, currency) for level in levels)
+
+
+def build_html_report(report: Dict[str, Any]) -> str:
+    technical = report["technical"]
+    fundamental = report["fundamental"]
+    sentiment = report["sentiment"]
+    risk = report["risk"]
+    thesis = report["thesis"]
+    currency = report["currency"]
+    entry_low, entry_high = thesis.details["entry_zone"]
+    target_1 = thesis.details["target_1"]
+    target_2 = thesis.details["target_2"]
+    stop = thesis.details["stop_loss"]
+    rr = (target_1 - ((entry_low + entry_high) / 2)) / max(((entry_low + entry_high) / 2) - stop, 0.01)
+
+    news_rows = ""
+    for item in sentiment.details.get("news_items", [])[:5]:
+        title = html_escape(item["title"])
+        if item.get("link"):
+            title = f'<a href="{html_escape(item["link"])}" target="_blank" rel="noreferrer">{title}</a>'
+        news_rows += (
+            f"<tr><td>{html_escape(item.get('published') or 'Recent')}</td>"
+            f"<td>{title}</td><td>{html_escape(item.get('tone', 'Neutral'))}</td></tr>"
+        )
+    if not news_rows:
+        news_rows = "<tr><td colspan='3'>No recent Yahoo Finance headlines returned for this symbol.</td></tr>"
+
+    catalyst_rows = "".join(
+        f"<tr><td>{html_escape(row['date'])}</td><td>{html_escape(row['event'])}</td><td>{html_escape(row['impact'])}</td></tr>"
+        for row in thesis.details["catalysts"]
+    )
+    risk_rows = "".join(
+        f"<tr><td>{html_escape(row['risk'])}</td><td>{html_escape(row['probability'])}</td><td>{html_escape(row['impact'])}</td><td>{html_escape(row['mitigation'])}</td></tr>"
+        for row in risk.details["key_risks"]
+    )
+    bull_rows = "".join(f"<li>{html_escape(item)}</li>" for item in thesis.details["bull_case"])
+    bear_rows = "".join(f"<li>{html_escape(item)}</li>" for item in thesis.details["bear_case"])
+
+    return f"""
+    <article class="report">
+        <section class="report-page hero-report">
+            <div>
+                <p class="eyebrow">Generated {html_escape(report['retrieved_at'])}</p>
+                <h1>{html_escape(report['company_name'])}</h1>
+                <p class="ticker">{html_escape(report['symbol'])} | {html_escape(report['exchange'])} | {html_escape(report['sector'])}</p>
+                <p class="summary-line">{html_escape(report['executive_summary'][0])}</p>
+            </div>
+            <div class="score-dial {html_escape(report['tone'])}">
+                <span>{report['composite']}</span>
+                <small>/ 100</small>
+                <strong>{html_escape(report['grade'])} - {html_escape(report['signal'])}</strong>
+            </div>
+        </section>
+
+        <section class="report-page">
+            <h2>1. Executive Summary</h2>
+            {"".join(f"<p>{html_escape(paragraph)}</p>" for paragraph in report["executive_summary"])}
+            <div class="metrics-grid">{render_score_cards(report)}</div>
+            <table>
+                <tbody>
+                    <tr><th>Current Price</th><td>{fmt_price(report['price'], currency)}</td><th>Market Cap</th><td>{fmt_money(report['market_cap'], currency)}</td></tr>
+                    <tr><th>52-Week Range</th><td>{fmt_price(report['fifty_two_week'][0], currency)} to {fmt_price(report['fifty_two_week'][1], currency)}</td><th>20D Avg Volume</th><td>{fmt_large_number(report['avg_volume'])}</td></tr>
+                    <tr><th>Industry</th><td>{html_escape(report['industry'])}</td><th>Next Earnings</th><td>{html_escape(report['next_earnings'])}</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="report-page">
+            <h2>2. Score Dashboard</h2>
+            <p>{html_escape(technical.summary)}</p>
+            <p>{html_escape(fundamental.summary)}</p>
+            <p>{html_escape(sentiment.summary)}</p>
+            <p>{html_escape(risk.summary)}</p>
+            <p>{html_escape(thesis.summary)}</p>
+            <table>
+                <thead><tr><th>Dimension</th><th>Score</th><th>Weight</th><th>Weighted</th></tr></thead>
+                <tbody>
+                    <tr><td>Technical Strength</td><td>{technical.score}/100</td><td>25%</td><td>{technical.score * 0.25:.1f}</td></tr>
+                    <tr><td>Fundamental Quality</td><td>{fundamental.score}/100</td><td>25%</td><td>{fundamental.score * 0.25:.1f}</td></tr>
+                    <tr><td>Sentiment & Momentum</td><td>{sentiment.score}/100</td><td>20%</td><td>{sentiment.score * 0.20:.1f}</td></tr>
+                    <tr><td>Risk Profile</td><td>{risk.score}/100</td><td>15%</td><td>{risk.score * 0.15:.1f}</td></tr>
+                    <tr><td>Thesis Conviction</td><td>{thesis.score}/100</td><td>15%</td><td>{thesis.score * 0.15:.1f}</td></tr>
+                    <tr class="total"><td>Composite Trade Score</td><td colspan="2">{html_escape(report['grade'])} - {html_escape(report['signal'])}</td><td>{report['composite']}/100</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="report-page">
+            <h2>3. Technical Analysis</h2>
+            <p>{html_escape(technical.summary)}</p>
+            <ul>{render_bullets(technical.bullets)}</ul>
+            <table>
+                <thead><tr><th>Sub-Dimension</th><th>Score</th><th>Visual</th><th>Assessment</th></tr></thead>
+                <tbody>{render_subscore_table(technical)}</tbody>
+            </table>
+            <table>
+                <tbody>
+                    <tr><th>Support</th><td>{render_levels(technical.details['support'], currency)}</td></tr>
+                    <tr><th>Resistance</th><td>{render_levels(technical.details['resistance'], currency)}</td></tr>
+                    <tr><th>RSI / MACD</th><td>RSI {technical.details['rsi']:.1f}; MACD {technical.details['macd']:.2f} vs signal {technical.details['macd_signal']:.2f}</td></tr>
+                    <tr><th>Returns</th><td>1M {fmt_pct(technical.details['returns']['1M'])}, 3M {fmt_pct(technical.details['returns']['3M'])}, 6M {fmt_pct(technical.details['returns']['6M'])}, 1Y {fmt_pct(technical.details['returns']['1Y'])}</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="report-page">
+            <h2>4. Fundamental Analysis</h2>
+            <p>{html_escape(fundamental.summary)}</p>
+            <ul>{render_bullets(fundamental.bullets)}</ul>
+            <table>
+                <thead><tr><th>Sub-Dimension</th><th>Score</th><th>Visual</th><th>Assessment</th></tr></thead>
+                <tbody>{render_subscore_table(fundamental)}</tbody>
+            </table>
+            <table>
+                <tbody>
+                    <tr><th>Revenue Growth</th><td>{fmt_pct(fundamental.details['revenue_growth'])}</td><th>EPS Growth</th><td>{fmt_pct(fundamental.details['earnings_growth'])}</td></tr>
+                    <tr><th>Operating Margin</th><td>{fmt_pct(fundamental.details['operating_margin'])}</td><th>Net Margin</th><td>{fmt_pct(fundamental.details['net_margin'])}</td></tr>
+                    <tr><th>Free Cash Flow</th><td>{fmt_money(fundamental.details['fcf'], currency)}</td><th>Dividend Yield</th><td>{fmt_pct(fundamental.details['dividend_yield'])}</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="report-page">
+            <h2>5. Sentiment And Market Narrative</h2>
+            <p>{html_escape(sentiment.summary)}</p>
+            <ul>{render_bullets(sentiment.bullets)}</ul>
+            <table>
+                <thead><tr><th>Sub-Dimension</th><th>Score</th><th>Visual</th><th>Assessment</th></tr></thead>
+                <tbody>{render_subscore_table(sentiment)}</tbody>
+            </table>
+            <h3>Recent Headlines</h3>
+            <table>
+                <thead><tr><th>Date</th><th>Headline</th><th>Tone</th></tr></thead>
+                <tbody>{news_rows}</tbody>
+            </table>
+        </section>
+
+        <section class="report-page">
+            <h2>6. Risk Assessment</h2>
+            <p>{html_escape(risk.summary)}</p>
+            <ul>{render_bullets(risk.bullets)}</ul>
+            <table>
+                <thead><tr><th>Sub-Dimension</th><th>Score</th><th>Visual</th><th>Assessment</th></tr></thead>
+                <tbody>{render_subscore_table(risk)}</tbody>
+            </table>
+            <h3>Top Risks</h3>
+            <table>
+                <thead><tr><th>Risk</th><th>Probability</th><th>Impact</th><th>Mitigation</th></tr></thead>
+                <tbody>{risk_rows}</tbody>
+            </table>
+        </section>
+
+        <section class="report-page">
+            <h2>7. Investment Thesis</h2>
+            <p>{html_escape(thesis.summary)}</p>
+            <ul>{render_bullets(thesis.bullets)}</ul>
+            <table>
+                <thead><tr><th>Sub-Dimension</th><th>Score</th><th>Visual</th><th>Assessment</th></tr></thead>
+                <tbody>{render_subscore_table(thesis)}</tbody>
+            </table>
+            <div class="two-column">
+                <section>
+                    <h3>Bull Case</h3>
+                    <ul>{bull_rows}</ul>
+                </section>
+                <section>
+                    <h3>Bear Case</h3>
+                    <ul>{bear_rows}</ul>
+                </section>
+            </div>
+        </section>
+
+        <section class="report-page">
+            <h2>8. Entry, Exit, And Catalyst Plan</h2>
+            <table>
+                <tbody>
+                    <tr><th>Entry Zone</th><td>{fmt_price(entry_low, currency)} to {fmt_price(entry_high, currency)}</td></tr>
+                    <tr><th>Stop Loss</th><td>{fmt_price(stop, currency)}</td></tr>
+                    <tr><th>Target 1</th><td>{fmt_price(target_1, currency)}</td></tr>
+                    <tr><th>Target 2</th><td>{fmt_price(target_2, currency)}</td></tr>
+                    <tr><th>Risk / Reward</th><td>{rr:.1f}:1 to Target 1</td></tr>
+                    <tr><th>Timeframe</th><td>{html_escape(thesis.details['timeframe'])}</td></tr>
+                    <tr><th>Sample Position</th><td>{risk.details['sample_position_shares']} shares for a sample INR 5 lakh account at 2% risk</td></tr>
+                </tbody>
+            </table>
+            <h3>Catalyst Calendar</h3>
+            <table>
+                <thead><tr><th>Date</th><th>Event</th><th>Expected Impact</th></tr></thead>
+                <tbody>{catalyst_rows}</tbody>
+            </table>
+            <p class="disclaimer">{html_escape(report['disclaimer'])}</p>
+        </section>
+    </article>
+    """
+
+
+PAGE_TEMPLATE = """
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dalal Street AI — Indian Equity Research</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
-<style>
-:root {
-  --bg:       #0a0c0f;
-  --surface:  #111418;
-  --surface2: #181c22;
-  --border:   #232a35;
-  --gold:     #e8b84b;
-  --gold2:    #f5d37a;
-  --green:    #2ecc71;
-  --red:      #e74c3c;
-  --blue:     #4a9eff;
-  --text:     #e8eaf0;
-  --muted:    #5a6478;
-}
-*{margin:0;padding:0;box-sizing:border-box}
-
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: 'IBM Plex Sans', sans-serif;
-  min-height: 100vh;
-}
-
-/* subtle paper grain */
-body::after {
-  content:'';position:fixed;inset:0;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
-  pointer-events:none;z-index:0;opacity:0.4;
-}
-
-.wrapper{position:relative;z-index:1;max-width:1000px;margin:0 auto;padding:0 24px 80px}
-
-/* ── Header ── */
-header {
-  padding: 52px 0 36px;
-  text-align: center;
-  border-bottom: 1px solid var(--border);
-  margin-bottom: 40px;
-}
-
-.brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 18px;
-}
-.brand-icon {
-  width: 36px; height: 36px;
-  background: linear-gradient(135deg, var(--gold), #c8972a);
-  border-radius: 8px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 18px;
-}
-.brand-name {
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 13px;
-  letter-spacing: 0.2em;
-  text-transform: uppercase;
-  color: var(--gold);
-  font-weight: 500;
-}
-
-h1 {
-  font-family: 'Playfair Display', serif;
-  font-size: clamp(2rem, 5vw, 3.4rem);
-  font-weight: 900;
-  line-height: 1.1;
-  letter-spacing: -0.02em;
-  color: var(--text);
-  margin-bottom: 10px;
-}
-h1 em { color: var(--gold); font-style: normal; }
-
-.tagline {
-  color: var(--muted);
-  font-size: 15px;
-  font-weight: 300;
-}
-
-/* ── Search ── */
-.search-wrap { margin-top: 36px; display: flex; flex-direction: column; align-items: center; gap: 14px; }
-
-.search-row {
-  display: flex;
-  width: 100%;
-  max-width: 560px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  overflow: hidden;
-  transition: border-color .2s, box-shadow .2s;
-}
-.search-row:focus-within {
-  border-color: var(--gold);
-  box-shadow: 0 0 0 3px rgba(232,184,75,0.12);
-}
-
-.search-row input {
-  flex:1; background:transparent; border:none; outline:none;
-  padding: 16px 20px;
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 17px; font-weight: 500;
-  letter-spacing: 0.1em;
-  color: var(--text); text-transform: uppercase;
-}
-.search-row input::placeholder { color:var(--muted); font-size:13px; letter-spacing:.03em; text-transform:none; font-family:'IBM Plex Sans',sans-serif; font-weight:300 }
-
-.search-btn {
-  background: var(--gold);
-  color: #0a0c0f;
-  border: none;
-  padding: 16px 26px;
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 12px; font-weight: 500;
-  letter-spacing: 0.12em; text-transform: uppercase;
-  cursor: pointer; transition: background .2s;
-  display: flex; align-items: center; gap: 8px;
-}
-.search-btn:hover { background: var(--gold2); }
-.search-btn:disabled { background: var(--border); color: var(--muted); cursor: not-allowed; }
-
-.chips { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
-.chip {
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 11px; font-weight: 500; letter-spacing: .1em;
-  padding: 5px 12px;
-  border: 1px solid var(--border); border-radius: 20px;
-  color: var(--muted); cursor: pointer; transition: all .2s;
-}
-.chip:hover { border-color: var(--gold); color: var(--gold); background: rgba(232,184,75,.06); }
-
-/* ── Status ── */
-#status-bar {
-  display: none;
-  align-items: center; gap: 10px;
-  margin-top: 32px;
-  padding: 12px 18px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 12px; color: var(--gold); letter-spacing: .04em;
-}
-.spinner { width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--gold);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0 }
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* ── Stock Header ── */
-#stock-header { display:none; margin-top:36px; }
-
-.stock-meta {
-  display: flex; justify-content: space-between; align-items: flex-start;
-  flex-wrap: wrap; gap: 16px; margin-bottom: 6px;
-}
-.stock-name-block {}
-.stock-name {
-  font-family: 'Playfair Display', serif;
-  font-size: 1.7rem; font-weight: 700;
-  line-height: 1.2;
-}
-.badge {
-  display: inline-block;
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 10px; letter-spacing: .15em;
-  background: rgba(232,184,75,.12);
-  border: 1px solid rgba(232,184,75,.3);
-  color: var(--gold);
-  padding: 3px 9px; border-radius: 4px;
-  margin-left: 10px; vertical-align: middle;
-}
-.sub-meta { font-size: 13px; color: var(--muted); margin-top: 4px; }
-
-.price-block { text-align:right; }
-.cmp {
-  font-family: 'Playfair Display', serif;
-  font-size: 2.1rem; font-weight: 700;
-}
-.day-chg { font-size: 14px; margin-top: 3px; font-weight:500; }
-.up{color:var(--green)} .dn{color:var(--red)}
-
-.divider { border:none; border-top:1px solid var(--border); margin:18px 0; }
-
-.metrics { display:grid; grid-template-columns:repeat(auto-fill,minmax(155px,1fr)); gap:10px; margin-bottom:28px; }
-.metric {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px; padding:14px 16px;
-  transition: border-color .2s;
-}
-.metric:hover { border-color: rgba(232,184,75,.3); }
-.ml { font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
-.mv { font-family:'IBM Plex Mono',monospace; font-size:1rem; font-weight:500; color:var(--text); }
-
-/* ── Section tabs ── */
-.section-tabs {
-  display: flex; gap: 0;
-  border: 1px solid var(--border); border-radius: 8px;
-  overflow: hidden; margin-bottom: 0;
-}
-.tab {
-  flex:1; padding:10px 8px;
-  font-family:'IBM Plex Mono',monospace; font-size:10px;
-  letter-spacing:.08em; text-transform:uppercase;
-  text-align:center; color:var(--muted);
-  background:var(--surface); border:none;
-  cursor:pointer; transition:all .2s;
-  border-right: 1px solid var(--border);
-}
-.tab:last-child{border-right:none}
-.tab.active { background:var(--gold); color:#0a0c0f; font-weight:500; }
-
-/* ── Report ── */
-#report-section {
-  display:none; margin-top:0;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-top:none;
-  border-radius: 0 0 10px 10px;
-  overflow: hidden;
-}
-
-.report-topbar {
-  padding: 14px 24px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface2);
-  display:flex; align-items:center; justify-content:space-between;
-}
-.report-label {
-  font-family:'IBM Plex Mono',monospace; font-size:11px;
-  letter-spacing:.15em; text-transform:uppercase; color:var(--gold);
-}
-.report-actions { display:flex; gap:10px; align-items:center; }
-.copy-btn {
-  font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:.08em;
-  padding:5px 12px; border:1px solid var(--border); border-radius:5px;
-  color:var(--muted); background:transparent; cursor:pointer; transition:all .2s;
-}
-.copy-btn:hover { border-color:var(--gold); color:var(--gold); }
-.report-time { font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--muted); }
-
-.report-body {
-  padding: 32px 36px;
-  line-height: 1.8; font-size: 15px; font-weight:300;
-}
-
-/* Markdown */
-.report-body h2 {
-  font-family:'Playfair Display',serif; font-size:1.3rem; font-weight:700;
-  color:var(--gold); margin:36px 0 14px;
-  padding-bottom:10px; border-bottom:1px solid var(--border);
-}
-.report-body h2:first-child{margin-top:0}
-.report-body h3 {
-  font-family:'IBM Plex Sans',sans-serif; font-size:1rem; font-weight:600;
-  color:var(--text); margin:22px 0 10px;
-}
-.report-body p { margin-bottom:14px; color:#c8d0dc; line-height:1.8; }
-.report-body ul,.report-body ol { padding-left:22px; margin-bottom:14px; }
-.report-body li { margin-bottom:7px; color:#c8d0dc; }
-.report-body strong { color:var(--text); font-weight:600; }
-.report-body em { color:var(--gold2); font-style:normal; }
-.report-body hr { border:none; border-top:1px solid var(--border); margin:28px 0; }
-.report-body table {
-  width:100%; border-collapse:collapse; margin:16px 0; font-size:13px;
-  font-family:'IBM Plex Mono',monospace;
-}
-.report-body th {
-  background:var(--surface2); color:var(--gold);
-  padding:9px 14px; text-align:left; font-size:10px;
-  letter-spacing:.1em; text-transform:uppercase;
-  border:1px solid var(--border);
-}
-.report-body td { padding:9px 14px; border:1px solid var(--border); color:#c8d0dc; }
-.report-body tr:hover td { background:rgba(232,184,75,.03); }
-.report-body blockquote {
-  border-left:3px solid var(--gold); padding:10px 18px;
-  background:rgba(232,184,75,.05); border-radius:0 6px 6px 0; margin:14px 0;
-}
-
-.cursor {
-  display:inline-block; width:2px; height:1.1em;
-  background:var(--gold); margin-left:2px;
-  animation:blink 1s step-end infinite; vertical-align:text-bottom;
-}
-@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
-
-/* ── Error ── */
-#error-box {
-  display:none; margin-top:24px; padding:14px 20px;
-  background:rgba(231,76,60,.08); border:1px solid rgba(231,76,60,.3);
-  border-radius:8px; color:var(--red); font-size:14px;
-}
-
-/* Progress steps */
-.progress-steps {
-  display:none; margin-top:24px;
-  display:flex; flex-direction:column; gap:6px;
-}
-.step { display:flex; align-items:center; gap:10px; font-size:13px; color:var(--muted); }
-.step.done { color:var(--green); }
-.step.active { color:var(--gold); }
-.step-icon { font-size:14px; width:20px; text-align:center; flex-shrink:0; }
-
-@media(max-width:600px){
-  .metrics{grid-template-columns:repeat(2,1fr)}
-  .report-body{padding:20px 16px}
-  .stock-meta{flex-direction:column}
-  .price-block{text-align:left}
-  .section-tabs{display:none}
-}
-</style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Indian Stock Score Dashboard</title>
+    <style>
+        :root {
+            --ink: #17212b;
+            --muted: #5d6875;
+            --line: #d8dee7;
+            --paper: #f6f7f2;
+            --panel: #ffffff;
+            --green: #16865f;
+            --red: #b42335;
+            --amber: #b7791f;
+            --blue: #2563a6;
+            --plum: #654062;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: var(--ink);
+            background: var(--paper);
+            letter-spacing: 0;
+        }
+        a { color: var(--blue); }
+        .shell { max-width: 1180px; margin: 0 auto; padding: 24px; }
+        header.app-head {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 16px;
+            padding: 18px 0 22px;
+        }
+        h1, h2, h3, p { margin-top: 0; }
+        h1 { font-size: clamp(30px, 5vw, 58px); line-height: 1; margin-bottom: 12px; }
+        h2 { font-size: 26px; margin-bottom: 14px; }
+        h3 { font-size: 17px; margin-bottom: 10px; }
+        p { color: var(--muted); line-height: 1.55; }
+        .form-panel {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: 0 12px 40px rgba(23, 33, 43, 0.08);
+        }
+        form.search {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+            align-items: center;
+        }
+        input[type="text"] {
+            width: 100%;
+            min-height: 46px;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            padding: 0 14px;
+            font-size: 16px;
+            background: #fff;
+        }
+        button, .button {
+            min-height: 46px;
+            border: 0;
+            border-radius: 6px;
+            background: var(--ink);
+            color: #fff;
+            padding: 0 18px;
+            font-weight: 700;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            white-space: nowrap;
+        }
+        .button.secondary { background: var(--green); }
+        .hint { margin: 10px 0 0; font-size: 13px; }
+        .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+        .chip {
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 7px 10px;
+            background: #fff;
+            color: var(--ink);
+            text-decoration: none;
+            font-size: 13px;
+        }
+        .error {
+            background: #fff3f3;
+            border: 1px solid #efb5b5;
+            color: #8b1d2c;
+            padding: 14px;
+            border-radius: 8px;
+            margin: 18px 0;
+        }
+        .actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 18px 0; }
+        .report {
+            display: grid;
+            gap: 18px;
+        }
+        .report-page {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 24px;
+            box-shadow: 0 10px 30px rgba(23, 33, 43, 0.07);
+        }
+        .hero-report {
+            display: grid;
+            grid-template-columns: 1fr 220px;
+            gap: 24px;
+            align-items: center;
+            min-height: 320px;
+            background: linear-gradient(135deg, #ffffff 0%, #f7f1df 48%, #eaf3ef 100%);
+        }
+        .eyebrow {
+            text-transform: uppercase;
+            color: var(--plum);
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 0;
+            margin-bottom: 12px;
+        }
+        .ticker { color: var(--ink); font-weight: 700; }
+        .summary-line { max-width: 760px; }
+        .score-dial {
+            width: 200px;
+            height: 200px;
+            border-radius: 50%;
+            border: 18px solid var(--amber);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #fff;
+            justify-self: end;
+            text-align: center;
+        }
+        .score-dial.positive { border-color: var(--green); }
+        .score-dial.negative { border-color: var(--red); }
+        .score-dial.balanced { border-color: var(--blue); }
+        .score-dial span { font-size: 54px; font-weight: 900; line-height: 1; }
+        .score-dial small { color: var(--muted); }
+        .score-dial strong { margin-top: 8px; font-size: 13px; padding: 0 16px; }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 10px;
+            margin: 18px 0;
+        }
+        .metric {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 12px;
+            background: #fbfcfd;
+            min-height: 126px;
+        }
+        .metric span, .metric small { display: block; color: var(--muted); font-size: 12px; }
+        .metric strong { display: block; font-size: 34px; margin: 8px 0; }
+        .bar {
+            height: 8px;
+            width: 100%;
+            border-radius: 999px;
+            overflow: hidden;
+            background: #e6e9ee;
+        }
+        .bar span {
+            display: block;
+            height: 100%;
+            background: linear-gradient(90deg, var(--red), var(--amber), var(--green));
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 14px 0;
+            font-size: 14px;
+        }
+        th, td {
+            border-bottom: 1px solid var(--line);
+            padding: 10px;
+            text-align: left;
+            vertical-align: top;
+        }
+        th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+        tr.total td { font-weight: 900; background: #f2f5f4; }
+        ul { margin: 0 0 18px 18px; padding: 0; color: var(--muted); line-height: 1.55; }
+        .two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .two-column section {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 16px;
+            background: #fbfcfd;
+        }
+        .disclaimer {
+            font-size: 12px;
+            color: #6b4b12;
+            background: #fff7df;
+            border: 1px solid #ead28a;
+            border-radius: 8px;
+            padding: 12px;
+        }
+        footer { color: var(--muted); font-size: 12px; padding: 18px 0 36px; }
+        @media (max-width: 860px) {
+            .shell { padding: 14px; }
+            form.search, .hero-report, .two-column { grid-template-columns: 1fr; }
+            .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .score-dial { justify-self: start; }
+            table { display: block; overflow-x: auto; white-space: nowrap; }
+        }
+        @media print {
+            body { background: #fff; }
+            .form-panel, .actions, footer, .chips { display: none; }
+            .shell { max-width: none; padding: 0; }
+            .report { display: block; }
+            .report-page {
+                min-height: 100vh;
+                border: 0;
+                border-radius: 0;
+                box-shadow: none;
+                page-break-after: always;
+            }
+        }
+    </style>
 </head>
 <body>
-<div class="wrapper">
-
-  <header>
-    <div class="brand">
-      <div class="brand-icon">₹</div>
-      <span class="brand-name">Dalal Street AI</span>
-    </div>
-    <h1>Indian Equity<br><em>Research Engine</em></h1>
-    <p class="tagline">Institutional-grade NSE/BSE analysis. Enter any Indian stock symbol.</p>
-
-    <div class="search-wrap">
-      <div class="search-row">
-        <input type="text" id="ticker-input"
-          placeholder="e.g.  RELIANCE  ·  TCS  ·  INFY  ·  HDFCBANK"
-          maxlength="20" autocomplete="off" spellcheck="false">
-        <button class="search-btn" id="analyze-btn" onclick="startAnalysis()">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-          Analyse
-        </button>
-      </div>
-      <div class="chips">
-        <span class="chip" onclick="go('RELIANCE')">RELIANCE</span>
-        <span class="chip" onclick="go('TCS')">TCS</span>
-        <span class="chip" onclick="go('HDFCBANK')">HDFCBANK</span>
-        <span class="chip" onclick="go('INFY')">INFY</span>
-        <span class="chip" onclick="go('WIPRO')">WIPRO</span>
-        <span class="chip" onclick="go('ICICIBANK')">ICICIBANK</span>
-        <span class="chip" onclick="go('BAJFINANCE')">BAJFINANCE</span>
-        <span class="chip" onclick="go('TATAMOTORS')">TATAMOTORS</span>
-        <span class="chip" onclick="go('ADANIENT')">ADANIENT</span>
-      </div>
-    </div>
-  </header>
-
-  <div id="status-bar">
-    <div class="spinner"></div>
-    <span id="status-text">Initialising...</span>
-  </div>
-
-  <div id="error-box"></div>
-
-  <!-- Stock header -->
-  <div id="stock-header">
-    <div class="stock-meta">
-      <div class="stock-name-block">
-        <div class="stock-name" id="s-name">—</div>
-        <div class="sub-meta" id="s-meta">—</div>
-      </div>
-      <div class="price-block">
-        <div class="cmp" id="s-price">—</div>
-        <div class="day-chg" id="s-chg">—</div>
-      </div>
-    </div>
-    <hr class="divider">
-    <div class="metrics" id="metrics"></div>
-  </div>
-
-  <!-- Tabs + report -->
-  <div class="section-tabs" id="tabs" style="display:none">
-    <button class="tab active">Research Report</button>
-  </div>
-  <div id="report-section">
-    <div class="report-topbar">
-      <span class="report-label">🏦 Equity Research Report</span>
-      <div class="report-actions">
-        <button class="copy-btn" onclick="copyReport()">Copy Report</button>
-        <span class="report-time" id="report-time">—</span>
-      </div>
-    </div>
-    <div class="report-body" id="report-body"></div>
-  </div>
-
-</div>
-
-<script>
-const $ = id => document.getElementById(id);
-
-function go(t){ $('ticker-input').value=t; startAnalysis(); }
-
-$('ticker-input').addEventListener('keydown', e => { if(e.key==='Enter') startAnalysis(); });
-
-function fmtINR(v){
-  if(v==null||v===''||v==='N/A') return '—';
-  v=parseFloat(v);
-  if(isNaN(v)) return '—';
-  if(Math.abs(v)>=1e12) return '₹'+(v/1e12).toFixed(2)+' L Cr';
-  if(Math.abs(v)>=1e7)  return '₹'+(v/1e7).toFixed(2)+' Cr';
-  if(Math.abs(v)>=1e5)  return '₹'+(v/1e5).toFixed(2)+' L';
-  return '₹'+v.toFixed(2);
-}
-function fmtX(v,d=1){ if(v==null||isNaN(parseFloat(v))) return '—'; return parseFloat(v).toFixed(d)+'x'; }
-function fmtPct(v){ if(v==null||isNaN(parseFloat(v))) return '—'; return (parseFloat(v)*100).toFixed(1)+'%'; }
-function fmtN(v,d=2){ if(v==null||isNaN(parseFloat(v))) return '—'; return parseFloat(v).toFixed(d); }
-
-function renderStock(d){
-  $('s-name').innerHTML = d.name + `<span class="badge">${d.ticker}</span>`;
-  $('s-meta').textContent = [d.sector, d.industry, d.exchange].filter(x=>x&&x!=='N/A').join(' · ');
-
-  $('s-price').textContent = d.price ? '₹'+parseFloat(d.price).toFixed(2) : '—';
-  const chg = parseFloat(d.change_pct)||0;
-  const cls = chg>=0 ? 'up':'dn', arrow = chg>=0?'▲':'▼';
-  $('s-chg').innerHTML = `<span class="${cls}">${arrow} ${Math.abs(chg).toFixed(2)}%</span>`;
-
-  const metrics = [
-    {l:'Market Cap',    v: fmtINR(d.market_cap)},
-    {l:'P/E (TTM)',     v: fmtX(d.pe_ttm)},
-    {l:'Forward P/E',  v: fmtX(d.pe_fwd)},
-    {l:'P/B Ratio',    v: fmtX(d.pb)},
-    {l:'EPS (TTM)',     v: d.eps ? '₹'+fmtN(d.eps) : '—'},
-    {l:'52W High',      v: d['52w_high'] ? '₹'+fmtN(d['52w_high']) : '—'},
-    {l:'52W Low',       v: d['52w_low']  ? '₹'+fmtN(d['52w_low'])  : '—'},
-    {l:'50-DMA',        v: d.sma50  ? '₹'+fmtN(d.sma50)  : '—'},
-    {l:'200-DMA',       v: d.sma200 ? '₹'+fmtN(d.sma200) : '—'},
-    {l:'RSI (14)',      v: fmtN(d.rsi14,1)},
-    {l:'Beta',          v: fmtN(d.beta)},
-    {l:'ROE',           v: fmtPct(d.roe)},
-    {l:'Profit Margin', v: fmtPct(d.profit_margin)},
-    {l:'Div Yield',     v: d.dividend_yield ? fmtPct(d.dividend_yield) : '—'},
-    {l:'Target (Mean)', v: d.target_mean ? '₹'+fmtN(d.target_mean) : '—'},
-    {l:'Analyst View',  v: (d.recommendation||'—').toUpperCase()},
-  ];
-
-  $('metrics').innerHTML = metrics.map(m=>`
-    <div class="metric"><div class="ml">${m.l}</div><div class="mv">${m.v}</div></div>
-  `).join('');
-
-  $('stock-header').style.display='block';
-}
-
-let es, rawMd='';
-
-function startAnalysis(){
-  const raw = $('ticker-input').value.trim().toUpperCase();
-  if(!raw){ $('ticker-input').focus(); return; }
-
-  $('error-box').style.display='none';
-  $('stock-header').style.display='none';
-  $('report-section').style.display='none';
-  $('tabs').style.display='none';
-  $('report-body').innerHTML='';
-  $('analyze-btn').disabled=true;
-  rawMd='';
-
-  if(es) es.close();
-
-  $('status-bar').style.display='flex';
-  $('status-text').textContent='📡 Connecting to NSE/BSE data feed...';
-
-  es = new EventSource(`/analyze?ticker=${encodeURIComponent(raw)}`);
-
-  es.addEventListener('status', e => {
-    $('status-text').textContent = JSON.parse('"'+e.data+'"');
-  });
-
-  es.addEventListener('stockdata', e => {
-    renderStock(JSON.parse(e.data));
-  });
-
-  es.addEventListener('chunk', e => {
-    rawMd += JSON.parse('"'+e.data+'"');
-
-    if($('report-section').style.display!=='block'){
-      $('report-section').style.display='block';
-      $('tabs').style.display='flex';
-      $('report-time').textContent = new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'});
-    }
-
-    const body = $('report-body');
-    body.innerHTML = marked.parse(rawMd);
-    const cur = document.createElement('span');
-    cur.className='cursor'; body.appendChild(cur);
-    cur.scrollIntoView({behavior:'smooth',block:'nearest'});
-  });
-
-  es.addEventListener('done', e => {
-    $('status-bar').style.display='none';
-    $('analyze-btn').disabled=false;
-    es.close();
-    $('report-body').innerHTML = marked.parse(rawMd);
-  });
-
-  es.addEventListener('error', e => {
-    if(e.data){
-      $('error-box').style.display='block';
-      $('error-box').textContent = '⚠ ' + JSON.parse('"'+e.data+'"');
-    }
-    $('status-bar').style.display='none';
-    $('analyze-btn').disabled=false;
-    es.close();
-  });
-
-  es.onerror = () => {
-    if(es.readyState===EventSource.CLOSED) return;
-    $('status-bar').style.display='none';
-    $('analyze-btn').disabled=false;
-    es.close();
-  };
-}
-
-function copyReport(){
-  navigator.clipboard.writeText(rawMd).then(()=>{
-    const b=$('.copy-btn');
-    if(b){b.textContent='Copied!';setTimeout(()=>b.textContent='Copy Report',2000);}
-  });
-}
-document.querySelector && (document.querySelector('.copy-btn') && null);
-</script>
+    <main class="shell">
+        <header class="app-head">
+            <div>
+                <p class="eyebrow">Indian equity research dashboard</p>
+                <h1>Stock Score Report</h1>
+                <p>Enter an NSE/BSE stock name or ticker to generate an 8-section score report using technical, fundamental, sentiment, risk, and thesis lenses.</p>
+            </div>
+            <section class="form-panel">
+                <form class="search" method="get" action="/">
+                    <input type="text" name="symbol" value="{{ query }}" placeholder="Example: Reliance, TCS, INFY.NS, HDFCBANK" autocomplete="off">
+                    <button type="submit">Analyze</button>
+                </form>
+                <p class="hint">Data source: Yahoo Finance through yfinance. Use NSE tickers with .NS or BSE tickers with .BO when a company name is ambiguous.</p>
+                <div class="chips">
+                    <a class="chip" href="/?symbol=RELIANCE">Reliance</a>
+                    <a class="chip" href="/?symbol=TCS">TCS</a>
+                    <a class="chip" href="/?symbol=INFY">Infosys</a>
+                    <a class="chip" href="/?symbol=HDFCBANK">HDFC Bank</a>
+                    <a class="chip" href="/?symbol=TATAMOTORS">Tata Motors</a>
+                </div>
+            </section>
+        </header>
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+        {% if report_html %}
+            <div class="actions">
+                <a class="button secondary" href="{{ pdf_url }}">Download PDF</a>
+                <button onclick="window.print()">Print Report</button>
+            </div>
+            {{ report_html | safe }}
+        {% endif %}
+        <footer>{{ disclaimer }}</footer>
+    </main>
 </body>
 </html>
-
 """
 
-@app.route("/")
-def index():
-    return HTML_PAGE, 200, {"Content-Type": "text/html"}
 
-@app.route("/analyze")
-def analyze():
-    raw = request.args.get("ticker", "").strip()
-    if not raw:
-        return jsonify({"error": "No ticker provided"}), 400
-    ticker = resolve_indian_ticker(raw)
-    return Response(generate_analysis_stream(ticker), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+@app.route("/", methods=["GET"])
+def index() -> str:
+    query = request.args.get("symbol", "").strip()
+    error = ""
+    report_html = ""
+    pdf_url = ""
+    if query:
+        try:
+            report = build_report(query)
+            report_html = build_html_report(report)
+            pdf_url = url_for("download_pdf", symbol=query)
+        except Exception as exc:
+            error = str(exc)
+    return render_template_string(
+        PAGE_TEMPLATE,
+        query=query,
+        error=error,
+        report_html=report_html,
+        pdf_url=pdf_url,
+        disclaimer=DISCLAIMER,
+    )
+
+
+@app.route("/download.pdf", methods=["GET"])
+def download_pdf() -> Response:
+    query = request.args.get("symbol", "").strip()
+    if not query:
+        return Response("Missing symbol", status=400)
+    report = build_report(query)
+    pdf = build_pdf(report)
+    filename = f"{re.sub(r'[^A-Za-z0-9]+', '-', report['symbol']).strip('-')}-stock-score-report.pdf"
+    return send_file(
+        io.BytesIO(pdf),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+def para(text: Any, style: Any) -> Any:
+    from reportlab.platypus import Paragraph
+
+    return Paragraph(escape(str(text)).replace("\n", "<br/>"), style)
+
+
+def build_pdf(report: Dict[str, Any]) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import cm
+    from reportlab.platypus import PageBreak, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=1.4 * cm,
+        leftMargin=1.4 * cm,
+        topMargin=1.2 * cm,
+        bottomMargin=1.2 * cm,
+    )
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Small", parent=styles["BodyText"], fontSize=8, leading=10))
+    styles.add(ParagraphStyle(name="Muted", parent=styles["BodyText"], textColor=colors.HexColor("#5d6875")))
+    styles["Title"].textColor = colors.HexColor("#17212b")
+    styles["Heading1"].textColor = colors.HexColor("#17212b")
+    styles["Heading2"].textColor = colors.HexColor("#17212b")
+
+    story: List[Any] = []
+
+    def heading(title: str) -> None:
+        story.append(para(title, styles["Heading1"]))
+        story.append(Spacer(1, 8))
+
+    def add_table(rows: List[List[Any]], widths: Optional[List[float]] = None) -> None:
+        converted = []
+        for row in rows:
+            converted.append([cell if hasattr(cell, "wrap") else para(cell, styles["Small"]) for cell in row])
+        table = Table(converted, colWidths=widths, repeatRows=1 if len(rows) > 1 else 0)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf1f4")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#17212b")),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d8dee7")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ]
+            )
+        )
+        story.append(table)
+        story.append(Spacer(1, 10))
+
+    currency = report["currency"]
+    technical = report["technical"]
+    fundamental = report["fundamental"]
+    sentiment = report["sentiment"]
+    risk = report["risk"]
+    thesis = report["thesis"]
+    entry_low, entry_high = thesis.details["entry_zone"]
+
+    heading(f"{report['company_name']} ({report['symbol']})")
+    story.append(para(f"Composite Score: {report['composite']}/100 | Grade {report['grade']} | Signal {report['signal']}", styles["Heading2"]))
+    story.append(para(f"Generated: {report['retrieved_at']}", styles["Muted"]))
+    for paragraph in report["executive_summary"]:
+        story.append(para(paragraph, styles["BodyText"]))
+        story.append(Spacer(1, 6))
+    add_table(
+        [
+            ["Metric", "Value", "Metric", "Value"],
+            ["Price", fmt_price(report["price"], currency), "Market Cap", fmt_money(report["market_cap"], currency)],
+            ["Sector", report["sector"], "Industry", report["industry"]],
+            ["52W Range", f"{fmt_price(report['fifty_two_week'][0], currency)} to {fmt_price(report['fifty_two_week'][1], currency)}", "Next Earnings", report["next_earnings"]],
+        ]
+    )
+    story.append(PageBreak())
+
+    heading("2. Score Dashboard")
+    add_table(
+        [
+            ["Dimension", "Score", "Weight", "Weighted"],
+            ["Technical Strength", f"{technical.score}/100", "25%", f"{technical.score * 0.25:.1f}"],
+            ["Fundamental Quality", f"{fundamental.score}/100", "25%", f"{fundamental.score * 0.25:.1f}"],
+            ["Sentiment & Momentum", f"{sentiment.score}/100", "20%", f"{sentiment.score * 0.20:.1f}"],
+            ["Risk Profile", f"{risk.score}/100", "15%", f"{risk.score * 0.15:.1f}"],
+            ["Thesis Conviction", f"{thesis.score}/100", "15%", f"{thesis.score * 0.15:.1f}"],
+            ["Composite", f"{report['composite']}/100", report["grade"], report["signal"]],
+        ]
+    )
+    for block in [technical, fundamental, sentiment, risk, thesis]:
+        story.append(para(block.summary, styles["BodyText"]))
+    story.append(PageBreak())
+
+    heading("3. Technical Analysis")
+    add_block_to_pdf(story, styles, technical)
+    add_table(
+        [
+            ["Level", "Value"],
+            ["Support", render_pdf_levels(technical.details["support"], currency)],
+            ["Resistance", render_pdf_levels(technical.details["resistance"], currency)],
+            ["RSI / MACD", f"RSI {technical.details['rsi']:.1f}; MACD {technical.details['macd']:.2f} vs signal {technical.details['macd_signal']:.2f}"],
+            ["Returns", f"1M {fmt_pct(technical.details['returns']['1M'])}; 3M {fmt_pct(technical.details['returns']['3M'])}; 6M {fmt_pct(technical.details['returns']['6M'])}; 1Y {fmt_pct(technical.details['returns']['1Y'])}"],
+        ]
+    )
+    story.append(PageBreak())
+
+    heading("4. Fundamental Analysis")
+    add_block_to_pdf(story, styles, fundamental)
+    add_table(
+        [
+            ["Metric", "Value", "Metric", "Value"],
+            ["P/E", fmt_ratio(fundamental.details["pe"]), "Forward P/E", fmt_ratio(fundamental.details["forward_pe"])],
+            ["Revenue Growth", fmt_pct(fundamental.details["revenue_growth"]), "EPS Growth", fmt_pct(fundamental.details["earnings_growth"])],
+            ["Operating Margin", fmt_pct(fundamental.details["operating_margin"]), "ROE", fmt_pct(fundamental.details["roe"])],
+            ["Debt/Equity", fmt_ratio(fundamental.details["debt_to_equity"]), "Free Cash Flow", fmt_money(fundamental.details["fcf"], currency)],
+        ]
+    )
+    story.append(PageBreak())
+
+    heading("5. Sentiment And Market Narrative")
+    add_block_to_pdf(story, styles, sentiment)
+    news_rows = [["Date", "Headline", "Tone"]]
+    for item in sentiment.details.get("news_items", [])[:5]:
+        news_rows.append([item.get("published") or "Recent", item.get("title", ""), item.get("tone", "Neutral")])
+    if len(news_rows) == 1:
+        news_rows.append(["Data unavailable", "No recent Yahoo Finance headlines returned.", "Neutral"])
+    add_table(news_rows, widths=[2.3 * cm, 12 * cm, 2.2 * cm])
+    story.append(PageBreak())
+
+    heading("6. Risk Assessment")
+    add_block_to_pdf(story, styles, risk)
+    risk_rows = [["Risk", "Probability", "Impact", "Mitigation"]]
+    for item in risk.details["key_risks"]:
+        risk_rows.append([item["risk"], item["probability"], item["impact"], item["mitigation"]])
+    add_table(risk_rows, widths=[4.3 * cm, 2.5 * cm, 2.2 * cm, 7 * cm])
+    story.append(PageBreak())
+
+    heading("7. Investment Thesis")
+    add_block_to_pdf(story, styles, thesis)
+    add_table(
+        [
+            ["Bull Case", "Bear Case"],
+            ["\n".join(thesis.details["bull_case"]), "\n".join(thesis.details["bear_case"])],
+        ],
+        widths=[8 * cm, 8 * cm],
+    )
+    story.append(PageBreak())
+
+    heading("8. Entry, Exit, And Catalyst Plan")
+    add_table(
+        [
+            ["Parameter", "Level / Note"],
+            ["Entry Zone", f"{fmt_price(entry_low, currency)} to {fmt_price(entry_high, currency)}"],
+            ["Stop Loss", fmt_price(thesis.details["stop_loss"], currency)],
+            ["Target 1", fmt_price(thesis.details["target_1"], currency)],
+            ["Target 2", fmt_price(thesis.details["target_2"], currency)],
+            ["Timeframe", thesis.details["timeframe"]],
+            ["Sample Position", f"{risk.details['sample_position_shares']} shares for a sample INR 5 lakh account at 2% risk"],
+        ]
+    )
+    catalyst_rows = [["Date", "Event", "Expected Impact"]]
+    for item in thesis.details["catalysts"]:
+        catalyst_rows.append([item["date"], item["event"], item["impact"]])
+    add_table(catalyst_rows, widths=[3 * cm, 6 * cm, 7 * cm])
+    story.append(para(DISCLAIMER, styles["Small"]))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def render_pdf_levels(levels: List[float], currency: str) -> str:
+    if not levels:
+        return "Data unavailable"
+    return ", ".join(fmt_price(level, currency) for level in levels)
+
+
+def add_block_to_pdf(story: List[Any], styles: Dict[str, Any], block: ScoreBlock) -> None:
+    from reportlab.lib.units import cm
+
+    story.append(para(block.summary, styles["BodyText"]))
+    for bullet in block.bullets:
+        story.append(para(f"- {bullet}", styles["BodyText"]))
+    rows = [["Sub-Dimension", "Score", "Assessment"]]
+    for name, item in block.sub_scores.items():
+        rows.append([name, f"{item['score']}/{item['max']}", item["assessment"]])
+    from reportlab.lib import colors
+    from reportlab.platypus import Spacer, Table, TableStyle
+
+    table = Table(
+        [[cell if hasattr(cell, "wrap") else para(cell, styles["Small"]) for cell in row] for row in rows],
+        colWidths=[4 * cm, 2 * cm, 10 * cm],
+        repeatRows=1,
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf1f4")),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d8dee7")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    story.append(Spacer(1, 8))
+    story.append(table)
+    story.append(Spacer(1, 10))
+
+
+def run_self_test() -> None:
+    assert resolve_candidates("Reliance")[0] == "RELIANCE.NS"
+    assert score_to_grade(86) == "A+"
+    assert "Buy" in score_to_signal(73)
+    assert fmt_pct(0.123) == "12.3%"
+    print("Self-test passed: symbol resolution and score helpers are working.")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Indian stock score dashboard")
+    parser.add_argument("--self-test", action="store_true", help="Run lightweight local checks and exit")
+    parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8050")))
+    parser.add_argument("--debug", action="store_true")
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    args = parse_args()
+    if args.self_test:
+        run_self_test()
+    else:
+        app.run(host=args.host, port=args.port, debug=args.debug)

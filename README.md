@@ -31,6 +31,12 @@ Open `http://localhost:8050`, then enter examples such as:
 - `HDFCBANK`
 - `TATAMOTORS.NS`
 
+To view ranked ideas, open:
+
+- `http://localhost:8050/top-picks`
+
+The **Scan NIFTY 100** button starts or reads the daily NIFTY 100 cache and shows the top 5 stocks scoring at least 90/100. Each row links back to the full 8-section stock report.
+
 ## Render Deployment
 
 The repository includes both `render.yaml` and `Procfile`.
@@ -48,12 +54,34 @@ For Render:
 
 If Render detects `render.yaml`, it can provision the service automatically.
 
+## Daily NIFTY 100 Cache
+
+The app keeps a JSON cache for the NIFTY 100 scanner. The cache is refreshed when:
+
+- A user opens `/top-picks?refresh=1` and the cache is missing or stale.
+- A user opens `/top-picks?refresh=force` to force a fresh scan.
+- A Render Cron Job calls `/refresh-cache` once per day.
+
+Recommended Render Cron Job command:
+
+```bash
+python -c "import os, urllib.request; base=os.environ['APP_BASE_URL'].rstrip('/'); token=os.environ.get('CACHE_REFRESH_TOKEN',''); urllib.request.urlopen(base + '/refresh-cache?force=1&token=' + token, timeout=30).read()"
+```
+
+Set these cron environment variables:
+
+- `APP_BASE_URL`: your Render web service URL, for example `https://your-app.onrender.com`
+- `CACHE_REFRESH_TOKEN`: optional shared secret. Add the same variable to the web service to protect the refresh endpoint.
+
+The web service should still use `gunicorn app:app` as the main Render start command.
+
 ## Data Notes
 
 - NSE tickers usually end with `.NS`.
 - BSE tickers usually end with `.BO`.
 - Common Indian stock names are mapped automatically, but exact tickers are best.
 - Free public feeds can have gaps in Indian analyst, insider, short-interest, and social sentiment data. Missing data is scored neutrally and called out in the report.
+- NIFTY 100 constituents are loaded from the official Nifty Indices CSV when available, with a bundled fallback list if that source is temporarily blocked.
 
 ## Disclaimer
 

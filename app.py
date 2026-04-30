@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import math
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from html import escape
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
-from flask import Flask, Response, render_template_string, request, send_file, url_for
+from flask import Flask, Response, jsonify, render_template_string, request, send_file, url_for
 
 
 app = Flask(__name__)
@@ -33,6 +37,127 @@ WEIGHTS = {
     "sentiment": 0.20,
     "risk": 0.15,
     "thesis": 0.15,
+}
+
+
+NIFTY100_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv"
+NIFTY100_FALLBACK_SYMBOLS = [
+    "ABB.NS",
+    "ADANIENSOL.NS",
+    "ADANIENT.NS",
+    "ADANIPORTS.NS",
+    "ADANIPOWER.NS",
+    "AMBUJACEM.NS",
+    "APOLLOHOSP.NS",
+    "ASIANPAINT.NS",
+    "AXISBANK.NS",
+    "BAJAJ-AUTO.NS",
+    "BAJFINANCE.NS",
+    "BAJAJFINSV.NS",
+    "BAJAJHLDNG.NS",
+    "BANKBARODA.NS",
+    "BEL.NS",
+    "BHARTIARTL.NS",
+    "BHEL.NS",
+    "BOSCHLTD.NS",
+    "BPCL.NS",
+    "BRITANNIA.NS",
+    "CANBK.NS",
+    "CHOLAFIN.NS",
+    "CIPLA.NS",
+    "COALINDIA.NS",
+    "DABUR.NS",
+    "DIVISLAB.NS",
+    "DLF.NS",
+    "DMART.NS",
+    "DRREDDY.NS",
+    "EICHERMOT.NS",
+    "GAIL.NS",
+    "GODREJCP.NS",
+    "GRASIM.NS",
+    "HAL.NS",
+    "HAVELLS.NS",
+    "HCLTECH.NS",
+    "HDFCBANK.NS",
+    "HDFCLIFE.NS",
+    "HEROMOTOCO.NS",
+    "HINDALCO.NS",
+    "HINDUNILVR.NS",
+    "HINDZINC.NS",
+    "ICICIBANK.NS",
+    "ICICIGI.NS",
+    "ICICIPRULI.NS",
+    "IDFCFIRSTB.NS",
+    "INDIGO.NS",
+    "INDUSINDBK.NS",
+    "INFY.NS",
+    "IOC.NS",
+    "IRFC.NS",
+    "ITC.NS",
+    "JINDALSTEL.NS",
+    "JIOFIN.NS",
+    "JSWENERGY.NS",
+    "JSWSTEEL.NS",
+    "KOTAKBANK.NS",
+    "LICI.NS",
+    "LODHA.NS",
+    "LT.NS",
+    "M&M.NS",
+    "MANKIND.NS",
+    "MARUTI.NS",
+    "MAXHEALTH.NS",
+    "MCDOWELL-N.NS",
+    "MOTHERSON.NS",
+    "NAUKRI.NS",
+    "NESTLEIND.NS",
+    "NTPC.NS",
+    "ONGC.NS",
+    "PFC.NS",
+    "PIDILITIND.NS",
+    "PNB.NS",
+    "POLYCAB.NS",
+    "POWERGRID.NS",
+    "RECLTD.NS",
+    "RELIANCE.NS",
+    "SBILIFE.NS",
+    "SBIN.NS",
+    "SHREECEM.NS",
+    "SHRIRAMFIN.NS",
+    "SIEMENS.NS",
+    "SUNPHARMA.NS",
+    "TATACONSUM.NS",
+    "TATAMOTORS.NS",
+    "TATAPOWER.NS",
+    "TATASTEEL.NS",
+    "TCS.NS",
+    "TECHM.NS",
+    "TITAN.NS",
+    "TORNTPOWER.NS",
+    "TORNTPHARM.NS",
+    "TRENT.NS",
+    "TVSMOTOR.NS",
+    "ULTRACEMCO.NS",
+    "VBL.NS",
+    "VEDL.NS",
+    "WIPRO.NS",
+    "ZYDUSLIFE.NS",
+    "ZOMATO.NS",
+]
+
+
+SCAN_CACHE_TTL_HOURS = int(os.getenv("SCAN_CACHE_TTL_HOURS", "24"))
+SCAN_CACHE_DIR = Path(os.getenv("SCAN_CACHE_DIR", "/tmp/indian-stock-score-dashboard"))
+SCAN_CACHE_FILE = SCAN_CACHE_DIR / "nifty100-top-picks.json"
+SCAN_LOCK = threading.Lock()
+SCAN_STATE: Dict[str, Any] = {
+    "running": False,
+    "started_at": "",
+    "completed_at": "",
+    "completed": 0,
+    "total": 0,
+    "last_symbol": "",
+    "message": "No scan has run in this app process yet.",
+    "errors": [],
 }
 
 
@@ -509,6 +634,239 @@ def load_stock_bundle(query: str) -> Dict[str, Any]:
         f"Tried: {', '.join(resolve_candidates(query)) or 'no candidates'}. "
         f"Details: {' | '.join(errors) if errors else 'No symbol candidates.'}"
     )
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_utc_now() -> str:
+    return utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc_iso(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def nifty_symbol(symbol: str) -> str:
+    clean = str(symbol or "").strip().upper()
+    if not clean:
+        return ""
+    return clean if clean.endswith((".NS", ".BO")) else f"{clean}.NS"
+
+
+def load_env_nifty100_symbols() -> List[str]:
+    raw = os.getenv("NIFTY100_SYMBOLS", "")
+    if not raw.strip():
+        return []
+    symbols = [nifty_symbol(item) for item in re.split(r"[\s,]+", raw) if item.strip()]
+    return list(dict.fromkeys(symbol for symbol in symbols if symbol))
+
+
+@lru_cache(maxsize=1)
+def load_nifty100_symbols() -> Tuple[List[str], str]:
+    env_symbols = load_env_nifty100_symbols()
+    if env_symbols:
+        return env_symbols, "NIFTY100_SYMBOLS environment variable"
+
+    try:
+        import requests
+
+        response = requests.get(
+            NIFTY100_CSV_URL,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+                ),
+                "Accept": "text/csv,application/csv,text/plain,*/*",
+                "Referer": "https://www.niftyindices.com/",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        frame = pd.read_csv(io.StringIO(response.text))
+        symbol_columns = [column for column in frame.columns if str(column).strip().lower() == "symbol"]
+        if symbol_columns:
+            symbols = [nifty_symbol(item) for item in frame[symbol_columns[0]].dropna().tolist()]
+            symbols = list(dict.fromkeys(symbol for symbol in symbols if symbol))
+            if len(symbols) >= 80:
+                return symbols, "official Nifty Indices constituent CSV"
+    except Exception:
+        pass
+
+    return NIFTY100_FALLBACK_SYMBOLS, "bundled NIFTY 100 fallback list"
+
+
+def load_scan_cache() -> Optional[Dict[str, Any]]:
+    try:
+        if not SCAN_CACHE_FILE.exists():
+            return None
+        with SCAN_CACHE_FILE.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def save_scan_cache(payload: Dict[str, Any]) -> None:
+    SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = SCAN_CACHE_FILE.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    temporary.replace(SCAN_CACHE_FILE)
+
+
+def cache_age_hours(cache: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not cache:
+        return None
+    created_at = parse_utc_iso(str(cache.get("created_at", "")))
+    if not created_at:
+        return None
+    return max(0.0, (utc_now() - created_at).total_seconds() / 3600)
+
+
+def is_scan_cache_fresh(cache: Optional[Dict[str, Any]]) -> bool:
+    age = cache_age_hours(cache)
+    return age is not None and age <= SCAN_CACHE_TTL_HOURS
+
+
+def update_scan_state(**kwargs: Any) -> None:
+    with SCAN_LOCK:
+        SCAN_STATE.update(kwargs)
+
+
+def current_scan_state() -> Dict[str, Any]:
+    with SCAN_LOCK:
+        return dict(SCAN_STATE)
+
+
+def summarize_report_for_scan(report: Dict[str, Any]) -> Dict[str, Any]:
+    technical = report["technical"]
+    risk = report["risk"]
+    thesis = report["thesis"]
+    return {
+        "symbol": report["symbol"],
+        "company_name": report["company_name"],
+        "sector": report["sector"],
+        "industry": report["industry"],
+        "price": round(float(report["price"]), 2),
+        "composite": int(report["composite"]),
+        "grade": report["grade"],
+        "signal": report["signal"],
+        "dimension_scores": report["dimension_scores"],
+        "entry_zone": [round(float(value), 2) for value in thesis.details["entry_zone"]],
+        "stop_loss": round(float(thesis.details["stop_loss"]), 2),
+        "target_1": round(float(thesis.details["target_1"]), 2),
+        "risk_reward": round(float(technical.details.get("risk_reward") or 0), 2),
+        "one_month_return": technical.details["returns"].get("1M"),
+        "risk_label": risk.label,
+        "report_generated_at": report["retrieved_at"],
+    }
+
+
+def run_nifty100_scan(force: bool = False) -> None:
+    cache = load_scan_cache()
+    if cache and is_scan_cache_fresh(cache) and not force:
+        update_scan_state(
+            running=False,
+            completed=len(cache.get("results", [])),
+            total=cache.get("total_symbols", 0),
+            completed_at=cache.get("created_at", ""),
+            message="Fresh NIFTY 100 cache is already available.",
+        )
+        return
+
+    symbols, source = load_nifty100_symbols()
+    started_at = iso_utc_now()
+    results: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    update_scan_state(
+        running=True,
+        started_at=started_at,
+        completed_at="",
+        completed=0,
+        total=len(symbols),
+        last_symbol="",
+        message="Scanning NIFTY 100 with the same scoring model used for full reports.",
+        errors=[],
+    )
+
+    for index, symbol in enumerate(symbols, start=1):
+        update_scan_state(last_symbol=symbol, completed=index - 1)
+        try:
+            report = build_report(symbol)
+            results.append(summarize_report_for_scan(report))
+        except Exception as exc:
+            errors.append({"symbol": symbol, "error": str(exc)})
+            update_scan_state(errors=errors[-8:])
+        update_scan_state(completed=index)
+
+    results.sort(key=lambda item: item["composite"], reverse=True)
+    payload = {
+        "universe": "NIFTY 100",
+        "source": source,
+        "created_at": iso_utc_now(),
+        "started_at": started_at,
+        "total_symbols": len(symbols),
+        "completed": len(results),
+        "failed": errors,
+        "results": results,
+        "disclaimer": DISCLAIMER,
+    }
+    save_scan_cache(payload)
+    update_scan_state(
+        running=False,
+        completed=len(symbols),
+        total=len(symbols),
+        completed_at=payload["created_at"],
+        last_symbol="",
+        message=f"NIFTY 100 scan complete. {len(results)} stocks scored; {len(errors)} failed.",
+        errors=errors[-8:],
+    )
+
+
+def ensure_scan_started(force: bool = False) -> bool:
+    cache = load_scan_cache()
+    if cache and is_scan_cache_fresh(cache) and not force:
+        return False
+
+    with SCAN_LOCK:
+        if SCAN_STATE.get("running"):
+            return False
+        SCAN_STATE.update(
+            {
+                "running": True,
+                "started_at": iso_utc_now(),
+                "completed_at": "",
+                "completed": 0,
+                "total": 0,
+                "last_symbol": "",
+                "message": "Starting NIFTY 100 scan.",
+                "errors": [],
+            }
+        )
+
+    thread = threading.Thread(target=run_nifty100_scan, kwargs={"force": force}, daemon=True)
+    thread.start()
+    return True
+
+
+def refresh_token_is_valid() -> bool:
+    configured = os.getenv("CACHE_REFRESH_TOKEN", "").strip()
+    if not configured:
+        return True
+    supplied = request.args.get("token", "").strip()
+    header = request.headers.get("Authorization", "")
+    bearer = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
+    return supplied == configured or bearer == configured
 
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -1701,12 +2059,134 @@ def build_html_report(report: Dict[str, Any]) -> str:
     """
 
 
+def render_top_pick_rows(items: List[Dict[str, Any]], empty_text: str) -> str:
+    if not items:
+        return f"<tr><td colspan='9'>{html_escape(empty_text)}</td></tr>"
+
+    rows = []
+    for rank, item in enumerate(items, start=1):
+        dims = item.get("dimension_scores", {})
+        entry_zone = item.get("entry_zone") or []
+        entry_text = (
+            f"{fmt_price(entry_zone[0])} to {fmt_price(entry_zone[1])}"
+            if len(entry_zone) == 2
+            else "Data unavailable"
+        )
+        rows.append(
+            f"""
+            <tr>
+                <td><strong>{rank}</strong></td>
+                <td>
+                    <strong>{html_escape(item.get('company_name', item.get('symbol', '')))}</strong>
+                    <small>{html_escape(item.get('symbol', ''))}</small>
+                </td>
+                <td><span class="score-pill">{safe_int(item.get('composite'))}</span></td>
+                <td>{html_escape(item.get('signal', ''))}</td>
+                <td>{html_escape(item.get('sector', 'Data unavailable'))}</td>
+                <td>{fmt_price(item.get('price'))}</td>
+                <td>{fmt_pct(item.get('one_month_return'))}</td>
+                <td>
+                    <small>Tech {safe_int(dims.get('technical'))} | Fund {safe_int(dims.get('fundamental'))} | Risk {safe_int(dims.get('risk'))}</small>
+                    <small>Entry {entry_text}</small>
+                </td>
+                <td><a class="mini-button" href="/?symbol={quote_plus(str(item.get('symbol', '')))}">View report</a></td>
+            </tr>
+            """
+        )
+    return "\n".join(rows)
+
+
+def build_top_picks_html(
+    cache: Optional[Dict[str, Any]],
+    state: Dict[str, Any],
+    min_score: int = 90,
+    limit: int = 5,
+) -> str:
+    results = sorted((cache or {}).get("results", []), key=lambda item: item.get("composite", 0), reverse=True)
+    qualifying = [item for item in results if safe_int(item.get("composite")) >= min_score][:limit]
+    strongest = results[:limit]
+    age = cache_age_hours(cache)
+    age_text = "No cache yet" if age is None else f"{age:.1f} hours old"
+    cache_created = (cache or {}).get("created_at", "Not available")
+    source = (cache or {}).get("source", "Not available")
+    failures = (cache or {}).get("failed", [])
+    running = bool(state.get("running"))
+    progress_total = safe_int(state.get("total"))
+    progress_done = safe_int(state.get("completed"))
+    progress_pct = int((progress_done / progress_total) * 100) if progress_total else 0
+    progress_label = (
+        f"{progress_done}/{progress_total} symbols scanned"
+        if progress_total
+        else "Preparing scanner"
+    )
+    status_class = "running" if running else "ready"
+    stale_badge = "" if cache and is_scan_cache_fresh(cache) else "<span class='badge warn'>Refresh due</span>"
+
+    nearest_html = ""
+    if not qualifying and strongest:
+        nearest_html = f"""
+        <section class="report-page">
+            <h2>Strongest Available Candidates</h2>
+            <p>No cached NIFTY 100 stock is currently above {min_score}/100. These are the five highest scores in the latest scan.</p>
+            <table class="pick-table">
+                <thead><tr><th>#</th><th>Stock</th><th>Score</th><th>Signal</th><th>Sector</th><th>Price</th><th>1M</th><th>Setup</th><th></th></tr></thead>
+                <tbody>{render_top_pick_rows(strongest, "No scan results available yet.")}</tbody>
+            </table>
+        </section>
+        """
+
+    recent_errors = "".join(
+        f"<li>{html_escape(item.get('symbol', ''))}: {html_escape(item.get('error', ''))}</li>"
+        for item in (state.get("errors") or failures)[-5:]
+    )
+    if recent_errors:
+        recent_errors = f"<details class='scan-errors'><summary>Recent skipped symbols</summary><ul>{recent_errors}</ul></details>"
+
+    return f"""
+    <section class="report-page scan-hero">
+        <div>
+            <p class="eyebrow">NIFTY 100 scanner</p>
+            <h2>Top 5 Stocks Above {min_score}</h2>
+            <p>The scanner runs the same 100-point technical, fundamental, sentiment, risk, and thesis model across the NIFTY 100 universe, then keeps the result in a daily cache.</p>
+            <div class="scan-actions">
+                <a class="button secondary" href="/top-picks?refresh=1">Use Daily Cache</a>
+                <a class="button" href="/top-picks?refresh=force">Refresh Now</a>
+                <a class="button quiet" href="/">Analyze One Stock</a>
+            </div>
+        </div>
+        <div class="scan-status {status_class}">
+            <strong>{'Scanning' if running else 'Cached'}</strong>
+            <span>{html_escape(progress_label if running else age_text)}</span>
+            <div class="bar"><span style="width:{progress_pct if running else 100}%"></span></div>
+            <small>{html_escape(state.get('message', ''))}</small>
+            {stale_badge}
+        </div>
+    </section>
+
+    <section class="report-page">
+        <h2>Qualified Picks</h2>
+        <p>Showing up to {limit} stocks from the latest NIFTY 100 scan with composite score of {min_score}/100 or higher. Cache generated: {html_escape(cache_created)}. Universe source: {html_escape(source)}.</p>
+        <table class="pick-table">
+            <thead><tr><th>#</th><th>Stock</th><th>Score</th><th>Signal</th><th>Sector</th><th>Price</th><th>1M</th><th>Setup</th><th></th></tr></thead>
+            <tbody>{render_top_pick_rows(qualifying, "No qualified stocks above this score yet. Start or refresh the scan, then this table will update.")}</tbody>
+        </table>
+        {recent_errors}
+    </section>
+    {nearest_html}
+    <section class="report-page">
+        <h2>Daily Cache Setup</h2>
+        <p>For automatic refresh, create a Render Cron Job that calls <code>/refresh-cache</code> once per day. The web service keeps the resulting JSON cache and this page reads from it instantly on later visits.</p>
+    </section>
+    """
+
+
 PAGE_TEMPLATE = """
 <!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% if auto_refresh %}<meta http-equiv="refresh" content="20">{% endif %}
     <title>Indian Stock Score Dashboard</title>
     <style>
         :root {
@@ -1781,7 +2261,13 @@ PAGE_TEMPLATE = """
             white-space: nowrap;
         }
         .button.secondary { background: var(--green); }
+        .button.quiet {
+            background: #eef2f5;
+            color: var(--ink);
+            border: 1px solid var(--line);
+        }
         .hint { margin: 10px 0 0; font-size: 13px; }
+        .quick-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
         .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
         .chip {
             border: 1px solid var(--line);
@@ -1801,6 +2287,71 @@ PAGE_TEMPLATE = """
             margin: 18px 0;
         }
         .actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 18px 0; }
+        .scan-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+        .scan-hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 280px;
+            gap: 20px;
+            align-items: center;
+            background: linear-gradient(135deg, #ffffff 0%, #eef7f1 52%, #f8f1e5 100%);
+        }
+        .scan-status {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 16px;
+            background: #fff;
+        }
+        .scan-status strong, .scan-status span, .scan-status small {
+            display: block;
+        }
+        .scan-status strong { font-size: 22px; }
+        .scan-status span { color: var(--muted); margin: 4px 0 12px; }
+        .scan-status small { color: var(--muted); margin-top: 10px; line-height: 1.4; }
+        .badge {
+            display: inline-flex;
+            width: fit-content;
+            margin-top: 10px;
+            border-radius: 999px;
+            padding: 5px 8px;
+            font-size: 12px;
+            font-weight: 800;
+            color: #6b4b12;
+            background: #fff7df;
+            border: 1px solid #ead28a;
+        }
+        .pick-table td small {
+            display: block;
+            color: var(--muted);
+            line-height: 1.45;
+        }
+        .score-pill {
+            display: inline-flex;
+            min-width: 44px;
+            justify-content: center;
+            border-radius: 999px;
+            padding: 6px 9px;
+            color: #fff;
+            background: var(--green);
+            font-weight: 900;
+        }
+        .mini-button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 34px;
+            border-radius: 6px;
+            padding: 0 10px;
+            background: var(--ink);
+            color: #fff;
+            text-decoration: none;
+            font-size: 12px;
+            font-weight: 800;
+            white-space: nowrap;
+        }
+        .scan-errors {
+            margin-top: 14px;
+            color: var(--muted);
+        }
         .report {
             display: grid;
             gap: 18px;
@@ -1909,7 +2460,7 @@ PAGE_TEMPLATE = """
         footer { color: var(--muted); font-size: 12px; padding: 18px 0 36px; }
         @media (max-width: 860px) {
             .shell { padding: 14px; }
-            form.search, .hero-report, .two-column { grid-template-columns: 1fr; }
+            form.search, .hero-report, .two-column, .scan-hero { grid-template-columns: 1fr; }
             .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .score-dial { justify-self: start; }
             table { display: block; overflow-x: auto; white-space: nowrap; }
@@ -1943,6 +2494,9 @@ PAGE_TEMPLATE = """
                     <button type="submit">Analyze</button>
                 </form>
                 <p class="hint">Data source: Yahoo Finance through yfinance. Use NSE tickers with .NS or BSE tickers with .BO when a company name is ambiguous.</p>
+                <div class="quick-actions">
+                    <a class="button secondary" href="/top-picks?refresh=1">Scan NIFTY 100</a>
+                </div>
                 <div class="chips">
                     <a class="chip" href="/?symbol=RELIANCE">Reliance</a>
                     <a class="chip" href="/?symbol=TCS">TCS</a>
@@ -1954,6 +2508,9 @@ PAGE_TEMPLATE = """
         </header>
         {% if error %}
             <div class="error">{{ error }}</div>
+        {% endif %}
+        {% if top_picks_html %}
+            {{ top_picks_html | safe }}
         {% endif %}
         {% if report_html %}
             <div class="actions">
@@ -1987,8 +2544,60 @@ def index() -> str:
         query=query,
         error=error,
         report_html=report_html,
+        top_picks_html="",
         pdf_url=pdf_url,
         disclaimer=DISCLAIMER,
+        auto_refresh=False,
+    )
+
+
+@app.route("/top-picks", methods=["GET"])
+def top_picks() -> str:
+    refresh = request.args.get("refresh", "").lower().strip()
+    min_score = safe_int(request.args.get("min_score"), 90)
+    limit = max(1, min(safe_int(request.args.get("limit"), 5), 20))
+    error = ""
+
+    cache = load_scan_cache()
+    force = refresh in {"force", "true-force"}
+    should_start = force or refresh in {"1", "true", "yes"} or not cache or not is_scan_cache_fresh(cache)
+    if should_start:
+        ensure_scan_started(force=force)
+
+    cache = load_scan_cache()
+    state = current_scan_state()
+    try:
+        top_picks_html = build_top_picks_html(cache, state, min_score=min_score, limit=limit)
+    except Exception as exc:
+        top_picks_html = ""
+        error = str(exc)
+
+    return render_template_string(
+        PAGE_TEMPLATE,
+        query="",
+        error=error,
+        report_html="",
+        top_picks_html=top_picks_html,
+        pdf_url="",
+        disclaimer=DISCLAIMER,
+        auto_refresh=bool(state.get("running")),
+    )
+
+
+@app.route("/refresh-cache", methods=["GET", "POST"])
+def refresh_cache() -> Response:
+    if not refresh_token_is_valid():
+        return jsonify({"ok": False, "error": "Invalid or missing CACHE_REFRESH_TOKEN."}), 403
+
+    force = request.args.get("force", "").lower() in {"1", "true", "yes"}
+    started = ensure_scan_started(force=force)
+    return jsonify(
+        {
+            "ok": True,
+            "started": started,
+            "state": current_scan_state(),
+            "cache_file": str(SCAN_CACHE_FILE),
+        }
     )
 
 
@@ -2230,12 +2839,15 @@ def run_self_test() -> None:
     assert score_to_grade(86) == "A+"
     assert "Buy" in score_to_signal(73)
     assert fmt_pct(0.123) == "12.3%"
+    symbols, _ = load_nifty100_symbols()
+    assert len(symbols) >= 80
     print("Self-test passed: symbol resolution and score helpers are working.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Indian stock score dashboard")
     parser.add_argument("--self-test", action="store_true", help="Run lightweight local checks and exit")
+    parser.add_argument("--refresh-cache", action="store_true", help="Refresh the NIFTY 100 scanner cache and exit")
     parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8050")))
     parser.add_argument("--debug", action="store_true")
@@ -2246,5 +2858,8 @@ if __name__ == "__main__":
     args = parse_args()
     if args.self_test:
         run_self_test()
+    elif args.refresh_cache:
+        run_nifty100_scan(force=True)
+        print(current_scan_state()["message"])
     else:
         app.run(host=args.host, port=args.port, debug=args.debug)

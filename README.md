@@ -12,7 +12,7 @@ The scoring model mirrors the uploaded trading-skills rubric:
 | Risk profile | 15% |
 | Thesis conviction | 15% |
 
-The app fetches public market data with `yfinance`, scores each dimension out of 100, creates a composite score, and renders an HTML report with a downloadable PDF.
+The app fetches public market data with `yfinance`, falls back to Yahoo's chart endpoint when needed, scores each dimension out of 100, creates a composite score, and renders an HTML report with a downloadable PDF.
 
 ## Run Locally
 

@@ -6,7 +6,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from html import escape
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -359,18 +359,115 @@ def import_yfinance():
     return yf
 
 
+def normalize_history_frame(history: Any) -> pd.DataFrame:
+    if history is None:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(history).copy()
+    if frame.empty:
+        return pd.DataFrame()
+
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = [str(col[0]) for col in frame.columns]
+
+    if "Date" not in frame.columns:
+        frame = frame.reset_index()
+
+    if "Date" in frame.columns:
+        dates = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
+        frame["Date"] = dates.dt.tz_localize(None)
+
+    if "Adj Close" not in frame.columns and "Close" in frame.columns:
+        frame["Adj Close"] = frame["Close"]
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    for column in required:
+        if column not in frame.columns:
+            frame[column] = np.nan
+
+    frame = frame.dropna(subset=["Close"])
+    return frame
+
+
+def fetch_yahoo_chart_history(symbol: str, days: int = 730) -> pd.DataFrame:
+    import requests
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    response = requests.get(
+        url,
+        params={
+            "period1": int(start.timestamp()),
+            "period2": int(end.timestamp()),
+            "interval": "1d",
+            "events": "history",
+        },
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+            )
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    result = (payload.get("chart", {}).get("result") or [None])[0]
+    if not result:
+        return pd.DataFrame()
+
+    timestamps = result.get("timestamp") or []
+    quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+    adjclose = (result.get("indicators", {}).get("adjclose") or [{}])[0].get("adjclose")
+
+    frame = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None),
+            "Open": quote.get("open"),
+            "High": quote.get("high"),
+            "Low": quote.get("low"),
+            "Close": quote.get("close"),
+            "Adj Close": adjclose or quote.get("close"),
+            "Volume": quote.get("volume"),
+        }
+    )
+    return normalize_history_frame(frame)
+
+
 @lru_cache(maxsize=64)
 def fetch_symbol_bundle(symbol: str) -> Dict[str, Any]:
     yf = import_yfinance()
     ticker = yf.Ticker(symbol)
 
-    history = ticker.history(period="2y", interval="1d", auto_adjust=False)
-    if history is None or history.empty:
-        raise ValueError(f"No price history returned for {symbol}.")
+    try:
+        history = normalize_history_frame(ticker.history(period="2y", interval="1d", auto_adjust=False))
+    except Exception:
+        history = pd.DataFrame()
 
-    history = history.reset_index()
-    if "Date" in history:
-        history["Date"] = pd.to_datetime(history["Date"]).dt.tz_localize(None)
+    if history.empty:
+        try:
+            history = normalize_history_frame(
+                yf.download(
+                    symbol,
+                    period="2y",
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
+            )
+        except Exception:
+            history = pd.DataFrame()
+
+    if history.empty:
+        try:
+            history = fetch_yahoo_chart_history(symbol)
+        except Exception:
+            history = pd.DataFrame()
+
+    if history.empty:
+        raise ValueError(f"No price history returned for {symbol}.")
 
     info: Dict[str, Any] = {}
     try:

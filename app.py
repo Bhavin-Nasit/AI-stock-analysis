@@ -660,12 +660,20 @@ def nifty_symbol(symbol: str) -> str:
     return clean if clean.endswith((".NS", ".BO")) else f"{clean}.NS"
 
 
+def is_tradable_nse_symbol(symbol: str) -> bool:
+    clean = str(symbol or "").strip().upper()
+    base = clean.split(".", 1)[0]
+    if not base or base.startswith("DUMMY"):
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9&-]+", base))
+
+
 def load_env_nifty100_symbols() -> List[str]:
     raw = os.getenv("NIFTY100_SYMBOLS", "")
     if not raw.strip():
         return []
     symbols = [nifty_symbol(item) for item in re.split(r"[\s,]+", raw) if item.strip()]
-    return list(dict.fromkeys(symbol for symbol in symbols if symbol))
+    return list(dict.fromkeys(symbol for symbol in symbols if is_tradable_nse_symbol(symbol)))
 
 
 @lru_cache(maxsize=1)
@@ -694,7 +702,7 @@ def load_nifty100_symbols() -> Tuple[List[str], str]:
         symbol_columns = [column for column in frame.columns if str(column).strip().lower() == "symbol"]
         if symbol_columns:
             symbols = [nifty_symbol(item) for item in frame[symbol_columns[0]].dropna().tolist()]
-            symbols = list(dict.fromkeys(symbol for symbol in symbols if symbol))
+            symbols = list(dict.fromkeys(symbol for symbol in symbols if is_tradable_nse_symbol(symbol)))
             if len(symbols) >= 80:
                 return symbols, "official Nifty Indices constituent CSV"
     except Exception:
@@ -2839,6 +2847,8 @@ def run_self_test() -> None:
     assert score_to_grade(86) == "A+"
     assert "Buy" in score_to_signal(73)
     assert fmt_pct(0.123) == "12.3%"
+    assert is_tradable_nse_symbol("VEDL.NS")
+    assert not is_tradable_nse_symbol("DUMMYVEDL3.NS")
     symbols, _ = load_nifty100_symbols()
     assert len(symbols) >= 80
     print("Self-test passed: symbol resolution and score helpers are working.")

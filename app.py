@@ -40,7 +40,7 @@ WEIGHTS = {
 }
 
 
-DEFAULT_SCAN_UNIVERSE = "NIFTY 100"
+DEFAULT_SCAN_UNIVERSE = "NIFTY 500"
 FORCE_REFRESH_SCAN_UNIVERSE = "NIFTY 500"
 NIFTY100_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv"
 NIFTY500_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
@@ -2233,7 +2233,7 @@ def build_top_picks_html(
             <h2>Top 5 Stocks Above {min_score}</h2>
             <p>The scanner runs the same 100-point technical, fundamental, sentiment, risk, and thesis model across the selected universe, then keeps the result in a separate cache.</p>
             <div class="scan-actions">
-                <a class="button secondary" href="/top-picks?refresh=1&universe=nifty100">Use Daily NIFTY 100 Cache</a>
+                <a class="button secondary" href="/top-picks?refresh=1&universe=nifty500">Use Daily NIFTY 500 Cache</a>
                 <a class="button" href="/top-picks?refresh=force&universe=nifty500">Refresh NIFTY 500 Now</a>
                 <a class="button quiet" href="/">Analyze One Stock</a>
             </div>
@@ -2259,7 +2259,7 @@ def build_top_picks_html(
     {nearest_html}
     <section class="report-page">
         <h2>Daily Cache Setup</h2>
-        <p>For automatic refresh, create a Render Cron Job that calls <code>/refresh-cache</code> once per day. The default cron refresh remains NIFTY 100; call <code>/refresh-cache?universe=nifty500</code> if you want the scheduled job to refresh NIFTY 500 instead.</p>
+        <p>For automatic refresh, create a Render Cron Job that calls <code>/refresh-cache</code> once per day. The default cron refresh now uses NIFTY 500 and keeps a separate NIFTY 500 cache.</p>
     </section>
     """
 
@@ -2579,7 +2579,7 @@ PAGE_TEMPLATE = """
                 </form>
                 <p class="hint">Data source: Yahoo Finance through yfinance. Use NSE tickers with .NS or BSE tickers with .BO when a company name is ambiguous.</p>
                 <div class="quick-actions">
-                    <a class="button secondary" href="/top-picks?refresh=1">Scan NIFTY 100</a>
+                    <a class="button secondary" href="/top-picks?refresh=1&universe=nifty500">Scan NIFTY 500</a>
                 </div>
                 <div class="chips">
                     <a class="chip" href="/?symbol=RELIANCE">Reliance</a>

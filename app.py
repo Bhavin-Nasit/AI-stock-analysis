@@ -40,7 +40,10 @@ WEIGHTS = {
 }
 
 
+DEFAULT_SCAN_UNIVERSE = "NIFTY 100"
+FORCE_REFRESH_SCAN_UNIVERSE = "NIFTY 500"
 NIFTY100_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv"
+NIFTY500_CSV_URL = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 NIFTY100_FALLBACK_SYMBOLS = [
     "ABB.NS",
     "ADANIENSOL.NS",
@@ -145,12 +148,30 @@ NIFTY100_FALLBACK_SYMBOLS = [
 ]
 
 
+INDEX_UNIVERSES = {
+    "NIFTY 100": {
+        "csv_url": NIFTY100_CSV_URL,
+        "env_var": "NIFTY100_SYMBOLS",
+        "fallback_symbols": NIFTY100_FALLBACK_SYMBOLS,
+        "min_symbols": 80,
+        "slug": "nifty100",
+    },
+    "NIFTY 500": {
+        "csv_url": NIFTY500_CSV_URL,
+        "env_var": "NIFTY500_SYMBOLS",
+        "fallback_symbols": [],
+        "min_symbols": 400,
+        "slug": "nifty500",
+    },
+}
+
+
 SCAN_CACHE_TTL_HOURS = int(os.getenv("SCAN_CACHE_TTL_HOURS", "24"))
 SCAN_CACHE_DIR = Path(os.getenv("SCAN_CACHE_DIR", "/tmp/indian-stock-score-dashboard"))
-SCAN_CACHE_FILE = SCAN_CACHE_DIR / "nifty100-top-picks.json"
 SCAN_LOCK = threading.Lock()
 SCAN_STATE: Dict[str, Any] = {
     "running": False,
+    "universe": "",
     "started_at": "",
     "completed_at": "",
     "completed": 0,
@@ -668,25 +689,41 @@ def is_tradable_nse_symbol(symbol: str) -> bool:
     return bool(re.fullmatch(r"[A-Z0-9&-]+", base))
 
 
-def load_env_nifty100_symbols() -> List[str]:
-    raw = os.getenv("NIFTY100_SYMBOLS", "")
+def normalize_universe(value: str) -> str:
+    cleaned = normalize_key(value or DEFAULT_SCAN_UNIVERSE).replace("NIFTY", "NIFTY ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if cleaned in {"NIFTY 500", "NIFTY500"}:
+        return "NIFTY 500"
+    return "NIFTY 100"
+
+
+def scan_cache_file(universe: str = DEFAULT_SCAN_UNIVERSE) -> Path:
+    normalized = normalize_universe(universe)
+    slug = INDEX_UNIVERSES[normalized]["slug"]
+    return SCAN_CACHE_DIR / f"{slug}-top-picks.json"
+
+
+def load_env_index_symbols(env_var: str) -> List[str]:
+    raw = os.getenv(env_var, "")
     if not raw.strip():
         return []
     symbols = [nifty_symbol(item) for item in re.split(r"[\s,]+", raw) if item.strip()]
     return list(dict.fromkeys(symbol for symbol in symbols if is_tradable_nse_symbol(symbol)))
 
 
-@lru_cache(maxsize=1)
-def load_nifty100_symbols() -> Tuple[List[str], str]:
-    env_symbols = load_env_nifty100_symbols()
+@lru_cache(maxsize=4)
+def load_index_symbols(universe: str = DEFAULT_SCAN_UNIVERSE) -> Tuple[List[str], str]:
+    normalized = normalize_universe(universe)
+    config = INDEX_UNIVERSES[normalized]
+    env_symbols = load_env_index_symbols(str(config["env_var"]))
     if env_symbols:
-        return env_symbols, "NIFTY100_SYMBOLS environment variable"
+        return env_symbols, f"{config['env_var']} environment variable"
 
     try:
         import requests
 
         response = requests.get(
-            NIFTY100_CSV_URL,
+            str(config["csv_url"]),
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -703,19 +740,31 @@ def load_nifty100_symbols() -> Tuple[List[str], str]:
         if symbol_columns:
             symbols = [nifty_symbol(item) for item in frame[symbol_columns[0]].dropna().tolist()]
             symbols = list(dict.fromkeys(symbol for symbol in symbols if is_tradable_nse_symbol(symbol)))
-            if len(symbols) >= 80:
-                return symbols, "official Nifty Indices constituent CSV"
+            if len(symbols) >= int(config["min_symbols"]):
+                return symbols, f"official Nifty Indices {normalized} constituent CSV"
     except Exception:
         pass
 
-    return NIFTY100_FALLBACK_SYMBOLS, "bundled NIFTY 100 fallback list"
+    fallback = list(config["fallback_symbols"])
+    if fallback:
+        return fallback, f"bundled {normalized} fallback list"
+
+    raise RuntimeError(
+        f"Could not load {normalized} symbols from the official Nifty Indices CSV. "
+        f"Set {config['env_var']} with comma-separated NSE tickers as an override."
+    )
 
 
-def load_scan_cache() -> Optional[Dict[str, Any]]:
+def load_nifty100_symbols() -> Tuple[List[str], str]:
+    return load_index_symbols("NIFTY 100")
+
+
+def load_scan_cache(universe: str = DEFAULT_SCAN_UNIVERSE) -> Optional[Dict[str, Any]]:
     try:
-        if not SCAN_CACHE_FILE.exists():
+        cache_file = scan_cache_file(universe)
+        if not cache_file.exists():
             return None
-        with SCAN_CACHE_FILE.open("r", encoding="utf-8") as handle:
+        with cache_file.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if not isinstance(payload, dict):
             return None
@@ -724,12 +773,13 @@ def load_scan_cache() -> Optional[Dict[str, Any]]:
         return None
 
 
-def save_scan_cache(payload: Dict[str, Any]) -> None:
+def save_scan_cache(payload: Dict[str, Any], universe: str = DEFAULT_SCAN_UNIVERSE) -> None:
     SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    temporary = SCAN_CACHE_FILE.with_suffix(".tmp")
+    cache_file = scan_cache_file(universe)
+    temporary = cache_file.with_suffix(".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
-    temporary.replace(SCAN_CACHE_FILE)
+    temporary.replace(cache_file)
 
 
 def cache_age_hours(cache: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -780,30 +830,47 @@ def summarize_report_for_scan(report: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def run_nifty100_scan(force: bool = False) -> None:
-    cache = load_scan_cache()
+def run_index_scan(universe: str = DEFAULT_SCAN_UNIVERSE, force: bool = False) -> None:
+    normalized = normalize_universe(universe)
+    cache = load_scan_cache(normalized)
     if cache and is_scan_cache_fresh(cache) and not force:
         update_scan_state(
             running=False,
+            universe=normalized,
             completed=len(cache.get("results", [])),
             total=cache.get("total_symbols", 0),
             completed_at=cache.get("created_at", ""),
-            message="Fresh NIFTY 100 cache is already available.",
+            message=f"Fresh {normalized} cache is already available.",
         )
         return
 
-    symbols, source = load_nifty100_symbols()
+    try:
+        symbols, source = load_index_symbols(normalized)
+    except Exception as exc:
+        update_scan_state(
+            running=False,
+            universe=normalized,
+            completed=0,
+            total=0,
+            completed_at=iso_utc_now(),
+            last_symbol="",
+            message=str(exc),
+            errors=[{"symbol": normalized, "error": str(exc)}],
+        )
+        return
+
     started_at = iso_utc_now()
     results: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
     update_scan_state(
         running=True,
+        universe=normalized,
         started_at=started_at,
         completed_at="",
         completed=0,
         total=len(symbols),
         last_symbol="",
-        message="Scanning NIFTY 100 with the same scoring model used for full reports.",
+        message=f"Scanning {normalized} with the same scoring model used for full reports.",
         errors=[],
     )
 
@@ -819,7 +886,7 @@ def run_nifty100_scan(force: bool = False) -> None:
 
     results.sort(key=lambda item: item["composite"], reverse=True)
     payload = {
-        "universe": "NIFTY 100",
+        "universe": normalized,
         "source": source,
         "created_at": iso_utc_now(),
         "started_at": started_at,
@@ -829,20 +896,26 @@ def run_nifty100_scan(force: bool = False) -> None:
         "results": results,
         "disclaimer": DISCLAIMER,
     }
-    save_scan_cache(payload)
+    save_scan_cache(payload, normalized)
     update_scan_state(
         running=False,
+        universe=normalized,
         completed=len(symbols),
         total=len(symbols),
         completed_at=payload["created_at"],
         last_symbol="",
-        message=f"NIFTY 100 scan complete. {len(results)} stocks scored; {len(errors)} failed.",
+        message=f"{normalized} scan complete. {len(results)} stocks scored; {len(errors)} failed.",
         errors=errors[-8:],
     )
 
 
-def ensure_scan_started(force: bool = False) -> bool:
-    cache = load_scan_cache()
+def run_nifty100_scan(force: bool = False) -> None:
+    run_index_scan("NIFTY 100", force=force)
+
+
+def ensure_scan_started(force: bool = False, universe: str = DEFAULT_SCAN_UNIVERSE) -> bool:
+    normalized = normalize_universe(universe)
+    cache = load_scan_cache(normalized)
     if cache and is_scan_cache_fresh(cache) and not force:
         return False
 
@@ -852,17 +925,18 @@ def ensure_scan_started(force: bool = False) -> bool:
         SCAN_STATE.update(
             {
                 "running": True,
+                "universe": normalized,
                 "started_at": iso_utc_now(),
                 "completed_at": "",
                 "completed": 0,
                 "total": 0,
                 "last_symbol": "",
-                "message": "Starting NIFTY 100 scan.",
+                "message": f"Starting {normalized} scan.",
                 "errors": [],
             }
         )
 
-    thread = threading.Thread(target=run_nifty100_scan, kwargs={"force": force}, daemon=True)
+    thread = threading.Thread(target=run_index_scan, kwargs={"universe": normalized, "force": force}, daemon=True)
     thread.start()
     return True
 
@@ -2107,9 +2181,11 @@ def render_top_pick_rows(items: List[Dict[str, Any]], empty_text: str) -> str:
 def build_top_picks_html(
     cache: Optional[Dict[str, Any]],
     state: Dict[str, Any],
+    universe: str = DEFAULT_SCAN_UNIVERSE,
     min_score: int = 90,
     limit: int = 5,
 ) -> str:
+    normalized = normalize_universe(universe)
     results = sorted((cache or {}).get("results", []), key=lambda item: item.get("composite", 0), reverse=True)
     qualifying = [item for item in results if safe_int(item.get("composite")) >= min_score][:limit]
     strongest = results[:limit]
@@ -2135,7 +2211,7 @@ def build_top_picks_html(
         nearest_html = f"""
         <section class="report-page">
             <h2>Strongest Available Candidates</h2>
-            <p>No cached NIFTY 100 stock is currently above {min_score}/100. These are the five highest scores in the latest scan.</p>
+            <p>No cached {normalized} stock is currently above {min_score}/100. These are the five highest scores in the latest scan.</p>
             <table class="pick-table">
                 <thead><tr><th>#</th><th>Stock</th><th>Score</th><th>Signal</th><th>Sector</th><th>Price</th><th>1M</th><th>Setup</th><th></th></tr></thead>
                 <tbody>{render_top_pick_rows(strongest, "No scan results available yet.")}</tbody>
@@ -2153,12 +2229,12 @@ def build_top_picks_html(
     return f"""
     <section class="report-page scan-hero">
         <div>
-            <p class="eyebrow">NIFTY 100 scanner</p>
+            <p class="eyebrow">{normalized} scanner</p>
             <h2>Top 5 Stocks Above {min_score}</h2>
-            <p>The scanner runs the same 100-point technical, fundamental, sentiment, risk, and thesis model across the NIFTY 100 universe, then keeps the result in a daily cache.</p>
+            <p>The scanner runs the same 100-point technical, fundamental, sentiment, risk, and thesis model across the selected universe, then keeps the result in a separate cache.</p>
             <div class="scan-actions">
-                <a class="button secondary" href="/top-picks?refresh=1">Use Daily Cache</a>
-                <a class="button" href="/top-picks?refresh=force">Refresh Now</a>
+                <a class="button secondary" href="/top-picks?refresh=1&universe=nifty100">Use Daily NIFTY 100 Cache</a>
+                <a class="button" href="/top-picks?refresh=force&universe=nifty500">Refresh NIFTY 500 Now</a>
                 <a class="button quiet" href="/">Analyze One Stock</a>
             </div>
         </div>
@@ -2173,7 +2249,7 @@ def build_top_picks_html(
 
     <section class="report-page">
         <h2>Qualified Picks</h2>
-        <p>Showing up to {limit} stocks from the latest NIFTY 100 scan with composite score of {min_score}/100 or higher. Cache generated: {html_escape(cache_created)}. Universe source: {html_escape(source)}.</p>
+        <p>Showing up to {limit} stocks from the latest {normalized} scan with composite score of {min_score}/100 or higher. Cache generated: {html_escape(cache_created)}. Universe source: {html_escape(source)}.</p>
         <table class="pick-table">
             <thead><tr><th>#</th><th>Stock</th><th>Score</th><th>Signal</th><th>Sector</th><th>Price</th><th>1M</th><th>Setup</th><th></th></tr></thead>
             <tbody>{render_top_pick_rows(qualifying, "No qualified stocks above this score yet. Start or refresh the scan, then this table will update.")}</tbody>
@@ -2183,7 +2259,7 @@ def build_top_picks_html(
     {nearest_html}
     <section class="report-page">
         <h2>Daily Cache Setup</h2>
-        <p>For automatic refresh, create a Render Cron Job that calls <code>/refresh-cache</code> once per day. The web service keeps the resulting JSON cache and this page reads from it instantly on later visits.</p>
+        <p>For automatic refresh, create a Render Cron Job that calls <code>/refresh-cache</code> once per day. The default cron refresh remains NIFTY 100; call <code>/refresh-cache?universe=nifty500</code> if you want the scheduled job to refresh NIFTY 500 instead.</p>
     </section>
     """
 
@@ -2566,16 +2642,18 @@ def top_picks() -> str:
     limit = max(1, min(safe_int(request.args.get("limit"), 5), 20))
     error = ""
 
-    cache = load_scan_cache()
     force = refresh in {"force", "true-force"}
+    requested_universe = request.args.get("universe", "")
+    universe = normalize_universe(requested_universe or (FORCE_REFRESH_SCAN_UNIVERSE if force else DEFAULT_SCAN_UNIVERSE))
+    cache = load_scan_cache(universe)
     should_start = force or refresh in {"1", "true", "yes"} or not cache or not is_scan_cache_fresh(cache)
     if should_start:
-        ensure_scan_started(force=force)
+        ensure_scan_started(force=force, universe=universe)
 
-    cache = load_scan_cache()
+    cache = load_scan_cache(universe)
     state = current_scan_state()
     try:
-        top_picks_html = build_top_picks_html(cache, state, min_score=min_score, limit=limit)
+        top_picks_html = build_top_picks_html(cache, state, universe=universe, min_score=min_score, limit=limit)
     except Exception as exc:
         top_picks_html = ""
         error = str(exc)
@@ -2598,13 +2676,15 @@ def refresh_cache() -> Response:
         return jsonify({"ok": False, "error": "Invalid or missing CACHE_REFRESH_TOKEN."}), 403
 
     force = request.args.get("force", "").lower() in {"1", "true", "yes"}
-    started = ensure_scan_started(force=force)
+    universe = normalize_universe(request.args.get("universe", DEFAULT_SCAN_UNIVERSE))
+    started = ensure_scan_started(force=force, universe=universe)
     return jsonify(
         {
             "ok": True,
+            "universe": universe,
             "started": started,
             "state": current_scan_state(),
-            "cache_file": str(SCAN_CACHE_FILE),
+            "cache_file": str(scan_cache_file(universe)),
         }
     )
 
@@ -2847,6 +2927,7 @@ def run_self_test() -> None:
     assert score_to_grade(86) == "A+"
     assert "Buy" in score_to_signal(73)
     assert fmt_pct(0.123) == "12.3%"
+    assert normalize_universe("nifty500") == "NIFTY 500"
     assert is_tradable_nse_symbol("VEDL.NS")
     assert not is_tradable_nse_symbol("DUMMYVEDL3.NS")
     symbols, _ = load_nifty100_symbols()
@@ -2857,7 +2938,8 @@ def run_self_test() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Indian stock score dashboard")
     parser.add_argument("--self-test", action="store_true", help="Run lightweight local checks and exit")
-    parser.add_argument("--refresh-cache", action="store_true", help="Refresh the NIFTY 100 scanner cache and exit")
+    parser.add_argument("--refresh-cache", action="store_true", help="Refresh a scanner cache and exit")
+    parser.add_argument("--universe", default=DEFAULT_SCAN_UNIVERSE, help="Scanner universe: nifty100 or nifty500")
     parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8050")))
     parser.add_argument("--debug", action="store_true")
@@ -2869,7 +2951,7 @@ if __name__ == "__main__":
     if args.self_test:
         run_self_test()
     elif args.refresh_cache:
-        run_nifty100_scan(force=True)
+        run_index_scan(args.universe, force=True)
         print(current_scan_state()["message"])
     else:
         app.run(host=args.host, port=args.port, debug=args.debug)

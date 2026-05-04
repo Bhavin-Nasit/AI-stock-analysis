@@ -35,7 +35,7 @@ To view ranked ideas, open:
 
 - `http://localhost:8050/top-picks`
 
-The **Scan NIFTY 100** button starts or reads the daily NIFTY 100 cache and shows the top 5 stocks scoring at least 90/100. Each row links back to the full 8-section stock report.
+The **Scan NIFTY 100** button starts or reads the daily NIFTY 100 cache and shows the top 5 stocks scoring at least 90/100. On the top-picks page, **Refresh NIFTY 500 Now** runs the broader NIFTY 500 scan into a separate cache. Each row links back to the full 8-section stock report.
 
 ## Render Deployment
 
@@ -58,9 +58,9 @@ If Render detects `render.yaml`, it can provision the service automatically.
 
 The app keeps a JSON cache for the NIFTY 100 scanner. The cache is refreshed when:
 
-- A user opens `/top-picks?refresh=1` and the cache is missing or stale.
-- A user opens `/top-picks?refresh=force` to force a fresh scan.
-- A Render Cron Job calls `/refresh-cache` once per day.
+- A user opens `/top-picks?refresh=1&universe=nifty100` and the NIFTY 100 cache is missing or stale.
+- A user opens `/top-picks?refresh=force&universe=nifty500` to force a fresh NIFTY 500 scan.
+- A Render Cron Job calls `/refresh-cache` once per day for the default NIFTY 100 cache.
 
 Recommended Render Cron Job command:
 
@@ -75,13 +75,19 @@ Set these cron environment variables:
 
 The web service should still use `gunicorn app:app` as the main Render start command.
 
+To schedule the larger NIFTY 500 refresh instead, call:
+
+```bash
+python -c "import os, urllib.request; base=os.environ['APP_BASE_URL'].rstrip('/'); token=os.environ.get('CACHE_REFRESH_TOKEN',''); urllib.request.urlopen(base + '/refresh-cache?force=1&universe=nifty500&token=' + token, timeout=30).read()"
+```
+
 ## Data Notes
 
 - NSE tickers usually end with `.NS`.
 - BSE tickers usually end with `.BO`.
 - Common Indian stock names are mapped automatically, but exact tickers are best.
 - Free public feeds can have gaps in Indian analyst, insider, short-interest, and social sentiment data. Missing data is scored neutrally and called out in the report.
-- NIFTY 100 constituents are loaded from the official Nifty Indices CSV when available, with a bundled fallback list if that source is temporarily blocked.
+- NIFTY 100 and NIFTY 500 constituents are loaded from official Nifty Indices CSV files when available. NIFTY 100 has a bundled fallback list; NIFTY 500 can also be supplied through `NIFTY500_SYMBOLS` if the official CSV is temporarily unavailable.
 
 ## Disclaimer
 
